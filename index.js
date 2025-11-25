@@ -1,6 +1,6 @@
 // ===============================================================
 // 📞 Voices Core - Voice Gateway v4 (Twilio + OpenAI Realtime)
-// Versión: sin commit, controlando respuestas activas
+// Versión: salida PCM16, sin commit, controlando respuestas activas
 // ===============================================================
 
 const http = require("http");
@@ -9,6 +9,7 @@ const WebSocket = require("ws");
 const PORT = process.env.PORT || 10000;
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+// Puedes cambiar este modelo si tienes otro realtime disponible
 const OPENAI_REALTIME_MODEL =
   process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview";
 
@@ -183,8 +184,10 @@ function connectOpenAI(callSid, streamSid) {
           instructions:
             "Eres un asistente de voz de Voices Core. Eres bilingüe (español/inglés). Saluda, detecta idioma, pide nombre, teléfono y motivo de la llamada. Responde corto, humano y cálido.",
           voice: "alloy",
+          // Twilio ENTRANTE: audio g711_ulaw/base64 desde PSTN
           input_audio_format: "g711_ulaw",
-          output_audio_format: "g711_ulaw",
+          // OpenAI SALIDA: PCM16 (16kHz) en base64
+          output_audio_format: "pcm16",
           modalities: ["audio", "text"],
         },
       })
@@ -208,7 +211,7 @@ function connectOpenAI(callSid, streamSid) {
       const code = event?.error?.code || "sin-codigo";
       console.error(`🧠 OPENAI-ERROR: CODE=${code} MSG=${msg}`);
 
-      // Si hubo error de respuesta activa o similar, liberamos pendingResponse
+      // Si hubo error, liberamos pendingResponse para poder pedir otra luego
       const call = calls.get(callSid);
       if (call) {
         call.pendingResponse = false;
@@ -217,16 +220,34 @@ function connectOpenAI(callSid, streamSid) {
       return;
     }
 
-    // Audio de salida
+    // Texto (por si quieres verlo luego en logs / debug)
+    if (event.type === "response.audio_transcript.delta") {
+      const text = event.delta || "";
+      if (text) {
+        console.log(`📝 Parcial transcript (${callSid}):`, text);
+      }
+    }
+
+    // Audio de salida en PCM16 (base64)
     if (event.type === "response.audio.delta") {
       const call = calls.get(callSid);
       if (!call || !call.twilioWs || call.twilioWs.readyState !== WebSocket.OPEN)
         return;
 
       const audio = event.delta?.audio;
-      if (!audio) return;
+      if (!audio) {
+        console.log("🔇 response.audio.delta sin audio");
+        return;
+      }
+
+      // Logueamos el tamaño del audio para ver que sí viene algo
+      console.log(
+        `🔊 Audio delta recibido de OpenAI (len base64=${audio.length}) para ${callSid}`
+      );
 
       try {
+        // Enviamos directamente el PCM16 en base64 a Twilio.
+        // Si Twilio no lo reproduce, el siguiente paso es convertir PCM16 → μ-law.
         call.twilioWs.send(
           JSON.stringify({
             event: "media",
