@@ -1,6 +1,7 @@
 // ============================
-// 📞 Voices Core - Voice Gateway v4 (Fase 2)
+// 📞 Voices Core - Voice Gateway v4 (Fase 2.1)
 // Twilio Media Streams  <->  VoicesCore Gateway (Render)  <->  OpenAI Realtime
+// Con response.create para que la IA responda
 // ============================
 
 const http = require("http");
@@ -20,7 +21,7 @@ if (!OPENAI_API_KEY) {
 }
 
 // Mapa en memoria para llamadas activas
-// callSid -> { twilioWs, openAiWs, streamSid }
+// callSid -> { twilioWs, openAiWs, streamSid, pendingResponse }
 const calls = new Map();
 
 // ---------------------------
@@ -71,9 +72,13 @@ wss.on("connection", (ws, request) => {
     }
 
     const event = data.event;
-    // console.log("📩 Evento Twilio:", event);
 
     switch (event) {
+      case "connected": {
+        console.log("🔗 Evento Twilio: connected");
+        break;
+      }
+
       case "start": {
         callSid = data.start?.callSid;
         streamSid = data.start?.streamSid;
@@ -87,13 +92,14 @@ wss.on("connection", (ws, request) => {
           twilioWs: ws,
           openAiWs,
           streamSid,
+          pendingResponse: false,
         });
 
         break;
       }
 
       case "media": {
-        // Audio del cliente en μ-law base64
+        console.log("🎙 Evento Twilio: media");
         const payload = data.media?.payload;
         if (!payload || !callSid) return;
 
@@ -103,23 +109,38 @@ wss.on("connection", (ws, request) => {
         }
 
         // Enviar audio a OpenAI Realtime
-        // NOTA: asumimos que el modelo soporta g711_ulaw como input.
         try {
+          // 1) Enviamos el audio (g711_ulaw base64)
           call.openAiWs.send(
             JSON.stringify({
               type: "input_audio_buffer.append",
-              audio: payload, // base64 μ-law directo desde Twilio
+              audio: payload,
             })
           );
 
-          // En esta fase simple, hacemos commit por chunk.
+          // 2) Confirmamos que terminamos este bloque
           call.openAiWs.send(
             JSON.stringify({
               type: "input_audio_buffer.commit",
             })
           );
+
+          // 3) Pedimos a OpenAI que genere una respuesta
+          if (!call.pendingResponse) {
+            call.pendingResponse = true;
+
+            call.openAiWs.send(
+              JSON.stringify({
+                type: "response.create",
+                response: {
+                  modalities: ["audio"],
+                  instructions: "Responde al usuario de manera breve y natural.",
+                },
+              })
+            );
+          }
         } catch (err) {
-          console.error("🚨 Error enviando audio a OpenAI:", err);
+          console.error("🚨 Error enviando audio/response.create a OpenAI:", err);
         }
 
         break;
@@ -218,14 +239,15 @@ Nunca inventes información de la empresa; si no sabes algo, di que lo confirmar
       return;
     }
 
-    // console.log("🧠 Evento OpenAI:", event.type);
+    // Log básico para ver qué llega
+    console.log("🧠 Evento OpenAI:", event.type);
 
-    // ⚠️ Esta parte depende del protocolo exacto del modelo realtime.
-    // Muchos ejemplos usan "response.audio.delta" con un campo "delta" o "audio".
-    // Aquí dejamos una plantilla que se puede ajustar si hace falta.
-
+    // Manejo de audio incremental
     if (event.type === "response.audio.delta") {
-      const call = calls.get(callSid);
+      const call = Array.from(calls.entries()).find(
+        ([id, c]) => id === callSid
+      )?.[1];
+
       if (!call || call.twilioWs.readyState !== WebSocket.OPEN) return;
 
       const audioB64 =
@@ -240,8 +262,7 @@ Nunca inventes información de la empresa; si no sabes algo, di que lo confirmar
         event: "media",
         streamSid: call.streamSid,
         media: {
-          // Debe ser μ-law base64; asumimos que OpenAI ya lo devuelve en g711_ulaw
-          payload: audioB64,
+          payload: audioB64, // asumimos g711_ulaw base64
         },
       };
 
@@ -249,6 +270,14 @@ Nunca inventes información de la empresa; si no sabes algo, di que lo confirmar
         call.twilioWs.send(JSON.stringify(frame));
       } catch (err) {
         console.error("🚨 Error enviando audio a Twilio:", err);
+      }
+    }
+
+    // Cuando la respuesta termina, liberamos el lock
+    if (event.type === "response.completed") {
+      const call = calls.get(callSid);
+      if (call) {
+        call.pendingResponse = false;
       }
     }
   });
@@ -300,4 +329,3 @@ function cleanupCall(callSid) {
 server.listen(PORT, () => {
   console.log(`🚀 Voice Gateway v4 escuchando en puerto ${PORT}`);
 });
-
