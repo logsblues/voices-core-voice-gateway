@@ -229,7 +229,8 @@ No inventes información de la empresa.
     if (event.type === "error") {
       const msg = event?.error?.message || "Error desconocido de OpenAI";
       const code = event?.error?.code || "sin-codigo";
-      console.error("🧠 OpenAI ERROR:", code, "-", msg);
+      console.error(`🧠 OPENAI-ERROR: CODE=${code} MSG=${msg}`);
+
       return;
     }
 
