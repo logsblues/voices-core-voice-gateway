@@ -1,6 +1,6 @@
 // ===============================================================
 // 📞 Voices Core - Voice Gateway v4 (Twilio + OpenAI Realtime)
-// Versión: CORREGIDA — soporta modalities ["audio","text"]
+// Versión: sin commit, controlando respuestas activas
 // ===============================================================
 
 const http = require("http");
@@ -16,7 +16,7 @@ if (!OPENAI_API_KEY) {
   console.warn("❌ Falta OPENAI_API_KEY en Render.");
 }
 
-// callSid -> { twilioWs, openAiWs, streamSid, framesAccumulated }
+// callSid -> { twilioWs, openAiWs, streamSid, framesAccumulated, pendingResponse }
 const calls = new Map();
 
 // ---------------------------
@@ -88,6 +88,7 @@ wss.on("connection", (ws) => {
           openAiWs,
           streamSid,
           framesAccumulated: 0,
+          pendingResponse: false,
         });
         break;
 
@@ -105,7 +106,7 @@ wss.on("connection", (ws) => {
         if (!payload) return;
 
         try {
-          // 1) Mandamos el frame de audio a OpenAI
+          // 1) Mandamos el frame de audio a OpenAI (lo deja en el buffer interno)
           call.openAiWs.send(
             JSON.stringify({
               type: "input_audio_buffer.append",
@@ -113,26 +114,18 @@ wss.on("connection", (ws) => {
             })
           );
 
-          // 2) Acumulamos frames
+          // 2) Contamos frames para saber cuándo pedir respuesta
           call.framesAccumulated = (call.framesAccumulated || 0) + 1;
           console.log(
             `🔊 Frames acumulados para ${callSid}: ${call.framesAccumulated}`
           );
 
-          // 3) Cada 50 frames → commit + response.create
-          if (call.framesAccumulated % 50 === 0) {
+          // 3) Cada 50 frames (~1s) y si NO hay respuesta en curso → pedimos una respuesta
+          if (!call.pendingResponse && call.framesAccumulated >= 50) {
             console.log(
-              `✅ Commit + response.create para ${callSid} (frames=${call.framesAccumulated})`
+              `✅ response.create para ${callSid} (frames=${call.framesAccumulated})`
             );
 
-            // Commit del audio
-            call.openAiWs.send(
-              JSON.stringify({
-                type: "input_audio_buffer.commit",
-              })
-            );
-
-            // Solicitar respuesta del modelo
             call.openAiWs.send(
               JSON.stringify({
                 type: "response.create",
@@ -143,9 +136,13 @@ wss.on("connection", (ws) => {
                 },
               })
             );
+
+            // Marcamos que hay una respuesta activa
+            call.pendingResponse = true;
+            call.framesAccumulated = 0;
           }
         } catch (err) {
-          console.error("🚨 Error enviando audio a OpenAI:", err);
+          console.error("🚨 Error enviando audio/response → OpenAI:", err);
         }
         break;
 
@@ -205,14 +202,22 @@ function connectOpenAI(callSid, streamSid) {
 
     console.log("🧠 Evento OpenAI:", event.type);
 
+    // Manejo de errores
     if (event.type === "error") {
       const msg = event?.error?.message || "sin mensaje";
       const code = event?.error?.code || "sin-codigo";
       console.error(`🧠 OPENAI-ERROR: CODE=${code} MSG=${msg}`);
+
+      // Si hubo error de respuesta activa o similar, liberamos pendingResponse
+      const call = calls.get(callSid);
+      if (call) {
+        call.pendingResponse = false;
+      }
+
       return;
     }
 
-    // Respuesta en audio
+    // Audio de salida
     if (event.type === "response.audio.delta") {
       const call = calls.get(callSid);
       if (!call || !call.twilioWs || call.twilioWs.readyState !== WebSocket.OPEN)
@@ -231,6 +236,15 @@ function connectOpenAI(callSid, streamSid) {
         );
       } catch (err) {
         console.error("🚨 Error enviando audio a Twilio:", err);
+      }
+    }
+
+    // Cuando termina una respuesta, liberamos pendingResponse
+    if (event.type === "response.completed") {
+      const call = calls.get(callSid);
+      if (call) {
+        call.pendingResponse = false;
+        console.log(`✅ Respuesta completada para ${callSid}`);
       }
     }
   });
