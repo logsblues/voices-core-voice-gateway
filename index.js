@@ -3,8 +3,8 @@
 // Twilio Media Streams  <->  VoicesCore Gateway (Render)  <->  OpenAI Realtime
 // ============================
 
-import http from "http";
-import WebSocket, { WebSocketServer } from "ws";
+const http = require("http");
+const WebSocket = require("ws");
 
 // ---------------------------
 // Configuración básica
@@ -32,7 +32,7 @@ const server = http.createServer((req, res) => {
 });
 
 // Servidor WebSocket sobre HTTP
-const wss = new WebSocketServer({ noServer: true });
+const wss = new WebSocket.Server({ noServer: true });
 
 // ---------------------------
 // Upgrade HTTP -> WebSocket
@@ -176,7 +176,7 @@ function connectOpenAiRealtime(callSid, streamSid) {
   openAiWs.on("open", () => {
     console.log("🧠 OpenAI WS conectado para CallSid:", callSid);
 
-    // Prompt maestro básico – aquí luego metemos tu v4 completo
+    // Prompt maestro básico – luego metemos el v4 completo
     const instructions = `
 Eres el asistente de voz de Voices Core.
 Eres totalmente bilingüe (español e inglés).
@@ -191,12 +191,10 @@ Tu objetivo en cada llamada:
 Nunca inventes información de la empresa; si no sabes algo, di que lo confirmará un agente humano.
     `.trim();
 
-    // Configurar la sesión de OpenAI
     const sessionUpdate = {
       type: "session.update",
       session: {
         instructions,
-        // IMPORTANTE: formatos de audio; se pueden ajustar según el modelo
         input_audio_format: "g711_ulaw",
         output_audio_format: "g711_ulaw",
         modalities: ["audio"],
@@ -220,23 +218,24 @@ Nunca inventes información de la empresa; si no sabes algo, di que lo confirmar
       return;
     }
 
-    // Puedes loguear tipos para inspección
     // console.log("🧠 Evento OpenAI:", event.type);
 
     // ⚠️ Esta parte depende del protocolo exacto del modelo realtime.
     // Muchos ejemplos usan "response.audio.delta" con un campo "delta" o "audio".
-    // Aquí dejamos una plantilla que Lovable/Devin puede ajustar.
+    // Aquí dejamos una plantilla que se puede ajustar si hace falta.
 
     if (event.type === "response.audio.delta") {
       const call = calls.get(callSid);
       if (!call || call.twilioWs.readyState !== WebSocket.OPEN) return;
 
       const audioB64 =
-        event.delta?.audio || event.delta || event.audio || null;
+        (event.delta && event.delta.audio) ||
+        event.delta ||
+        event.audio ||
+        null;
 
       if (!audioB64) return;
 
-      // Enviar audio de vuelta a Twilio
       const frame = {
         event: "media",
         streamSid: call.streamSid,
@@ -252,9 +251,6 @@ Nunca inventes información de la empresa; si no sabes algo, di que lo confirmar
         console.error("🚨 Error enviando audio a Twilio:", err);
       }
     }
-
-    // También podrías manejar texto:
-    // if (event.type === "response.message.delta") { ... }
   });
 
   openAiWs.on("close", () => {
@@ -304,3 +300,4 @@ function cleanupCall(callSid) {
 server.listen(PORT, () => {
   console.log(`🚀 Voice Gateway v4 escuchando en puerto ${PORT}`);
 });
+
