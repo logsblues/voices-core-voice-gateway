@@ -1,6 +1,6 @@
 // ===============================================================
-// 📞 Voices Core - Voice Gateway v4 (Twilio + OpenAI Realtime)
-// Versión: una respuesta por llamada, VAD servidor, μ-law
+// 📞 Voices Core - Voice Gateway v4.1 (Twilio + OpenAI Realtime)
+// Versión: POR AHORA 1 respuesta por llamada, VAD servidor, μ-law
 // ===============================================================
 
 const http = require("http");
@@ -23,7 +23,7 @@ const calls = new Map();
 // ---------------------------
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Voices Core - Voice Gateway v4 running.\n");
+  res.end("Voices Core - Voice Gateway v4.1 running.\n");
 });
 
 // ---------------------------
@@ -84,7 +84,7 @@ wss.on("connection", (ws) => {
           openai: openAiWs,
           streamSid,
           pending: false,
-          hasResponded: false, // 👈 solo una respuesta por llamada (por ahora)
+          hasResponded: false, // por ahora solo una respuesta
         });
         break;
 
@@ -95,7 +95,6 @@ wss.on("connection", (ws) => {
         const payload = data.media?.payload;
         if (!payload) return;
 
-        // Solo mandamos audio de entrada al buffer
         try {
           call.openai.send(
             JSON.stringify({
@@ -107,7 +106,7 @@ wss.on("connection", (ws) => {
           console.error("🚨 Error enviando audio a OpenAI:", err);
         }
 
-        console.log(`🎙 Evento Twilio: media (CallSid ${callSid})`);
+        // console.log(`🎙 Evento Twilio: media (CallSid ${callSid})`);
         break;
       }
 
@@ -183,7 +182,6 @@ function connectOpenAI(callSid, streamSid) {
       const code = event?.error?.code || "sin-codigo";
       console.error(`🧠 OPENAI-ERROR: CODE=${code} MSG=${msg}`);
 
-      // No tocamos pending si el error es "conversation_already_has_active_response"
       if (code !== "conversation_already_has_active_response") {
         call.pending = false;
       }
@@ -194,7 +192,7 @@ function connectOpenAI(callSid, streamSid) {
     if (type === "input_audio_buffer.speech_stopped") {
       console.log("🧠 VAD: speech_stopped para", callSid);
 
-      // Solo pedimos UNA respuesta por llamada (por ahora)
+      // POR AHORA solo una respuesta por llamada
       if (!call.pending && !call.hasResponded) {
         try {
           ws.send(
@@ -203,7 +201,7 @@ function connectOpenAI(callSid, streamSid) {
               response: {
                 modalities: ["audio", "text"],
                 instructions:
-                  "Responde de forma muy breve, clara, cordial y humana. Prioriza audio. Saluda y presenta el servicio.",
+                  "Responde de forma muy breve, clara, cordial y humana. Prioriza audio. Saluda, preséntate como Voices Core y pide nombre, teléfono y motivo de la llamada.",
               },
             })
           );
@@ -232,9 +230,15 @@ function connectOpenAI(callSid, streamSid) {
 
     // 4) Audio generado por OpenAI → reenvío a Twilio
     if (type === "response.audio.delta") {
-      const audio = event.delta?.audio;
-      if (!audio) {
-        console.log("🔇 response.audio.delta sin audio");
+      // Soportar diferentes formas del payload (según versión de la API)
+      const rawDelta = event.delta;
+      const audio =
+        (rawDelta && rawDelta.audio) || // { delta: { audio: "..." } }
+        event.audio || // { audio: "..." }
+        rawDelta; // { delta: "..." } en algunos casos
+
+      if (!audio || typeof audio !== "string") {
+        console.log("🔇 response.audio.delta sin audio usable");
         return;
       }
 
@@ -301,5 +305,5 @@ function cleanupCall(callSid) {
 
 // ---------------------------
 server.listen(PORT, () => {
-  console.log(`🚀 Voice Gateway v4 escuchando en puerto ${PORT}`);
+  console.log(`🚀 Voice Gateway v4.1 escuchando en puerto ${PORT}`);
 });
