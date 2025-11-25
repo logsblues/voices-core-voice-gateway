@@ -1,6 +1,6 @@
 // ===============================================================
 // 📞 Voices Core - Voice Gateway v4 (Twilio + OpenAI Realtime)
-// Versión: Log simple para errores OpenAI (100% visible en Render)
+// Versión: acumula audio antes de commit (soluciona buffer too small)
 // ===============================================================
 
 const http = require("http");
@@ -16,15 +16,25 @@ if (!OPENAI_API_KEY) {
   console.warn("❌ Falta OPENAI_API_KEY en Render.");
 }
 
+// callSid -> { twilioWs, openAiWs, streamSid, pendingResponse, framesAccumulated }
 const calls = new Map();
 
+// ---------------------------
+// Servidor HTTP base
+// ---------------------------
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("Voices Core - Voice Gateway v4 is running.\n");
 });
 
+// ---------------------------
+// WebSocket Server
+// ---------------------------
 const wss = new WebSocket.Server({ noServer: true });
 
+// ---------------------------
+// Upgrade HTTP → WebSocket
+// ---------------------------
 server.on("upgrade", (req, socket, head) => {
   const { url } = req;
   console.log("🔁 HTTP upgrade solicitado. URL:", url);
@@ -40,6 +50,9 @@ server.on("upgrade", (req, socket, head) => {
   }
 });
 
+// ---------------------------
+// TWILIO → NUEVA CONEXIÓN WS
+// ---------------------------
 wss.on("connection", (ws) => {
   console.log("🌐 Nueva conexión WebSocket desde Twilio");
 
@@ -51,17 +64,22 @@ wss.on("connection", (ws) => {
     try {
       data = JSON.parse(msg.toString());
     } catch {
+      console.error("🚨 Error parseando JSON de Twilio");
       return;
     }
 
     const event = data.event;
 
     switch (event) {
+      case "connected":
+        console.log("🔗 Evento Twilio: connected");
+        break;
+
       case "start":
         callSid = data.start.callSid;
         streamSid = data.start.streamSid;
 
-        console.log(`▶️ Llamada iniciada: ${callSid}`);
+        console.log(`▶️ Llamada iniciada: ${callSid} (StreamSid: ${streamSid})`);
 
         const openAiWs = connectOpenAI(callSid, streamSid);
 
@@ -70,6 +88,7 @@ wss.on("connection", (ws) => {
           openAiWs,
           streamSid,
           pendingResponse: false,
+          framesAccumulated: 0,
         });
         break;
 
@@ -79,12 +98,15 @@ wss.on("connection", (ws) => {
         if (!callSid) return;
 
         const call = calls.get(callSid);
-        if (!call || !call.openAiWs) return;
+        if (!call || !call.openAiWs || call.openAiWs.readyState !== WebSocket.OPEN) {
+          return;
+        }
 
         const payload = data.media?.payload;
         if (!payload) return;
 
         try {
+          // 1) Mandamos el frame de audio a OpenAI (g711_ulaw base64)
           call.openAiWs.send(
             JSON.stringify({
               type: "input_audio_buffer.append",
@@ -92,28 +114,45 @@ wss.on("connection", (ws) => {
             })
           );
 
-          call.openAiWs.send(
-            JSON.stringify({
-              type: "input_audio_buffer.commit",
-            })
+          // 2) Acumulamos conteo de frames
+          call.framesAccumulated = (call.framesAccumulated || 0) + 1;
+          console.log(
+            `🔊 Frames acumulados para ${callSid}: ${call.framesAccumulated}`
           );
 
-          if (!call.pendingResponse) {
-            call.pendingResponse = true;
+          // 3) Solo si:
+          //    - No hay respuesta pendiente
+          //    - Ya tenemos >= 5 frames (≈100ms de audio)
+          //    => hacemos commit + response.create
+          if (!call.pendingResponse && call.framesAccumulated >= 5) {
+            console.log(
+              `✅ Enviando commit + response.create para ${callSid} (frames=${call.framesAccumulated})`
+            );
 
+            // Commit del buffer
+            call.openAiWs.send(
+              JSON.stringify({
+                type: "input_audio_buffer.commit",
+              })
+            );
+
+            // Pedimos respuesta
             call.openAiWs.send(
               JSON.stringify({
                 type: "response.create",
                 response: {
                   modalities: ["audio"],
                   instructions:
-                    "Responde de manera breve y clara al usuario.",
+                    "Responde de manera breve, clara, humana y cordial al usuario.",
                 },
               })
             );
+
+            call.pendingResponse = true;
+            call.framesAccumulated = 0;
           }
         } catch (err) {
-          console.error("🚨 Error enviando audio → OpenAI:", err);
+          console.error("🚨 Error enviando audio/commit/response → OpenAI:", err);
         }
         break;
 
@@ -121,6 +160,9 @@ wss.on("connection", (ws) => {
         console.log("⏹ Evento stop recibido:", callSid);
         cleanupCall(callSid);
         break;
+
+      default:
+        console.log("❓ Evento Twilio desconocido:", event);
     }
   });
 
@@ -149,7 +191,7 @@ function connectOpenAI(callSid, streamSid) {
         type: "session.update",
         session: {
           instructions:
-            "Eres un asistente de voz de Voices Core. Responde breve, cordial y bilingüe.",
+            "Eres un asistente de voz de Voices Core. Eres bilingüe (es/en), cordial y directo. Saluda, detecta idioma, pide nombre, teléfono y motivo de la llamada.",
           voice: "alloy",
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
@@ -164,6 +206,7 @@ function connectOpenAI(callSid, streamSid) {
     try {
       event = JSON.parse(data.toString());
     } catch {
+      console.error("🧠 Error parseando mensaje de OpenAI");
       return;
     }
 
@@ -172,16 +215,14 @@ function connectOpenAI(callSid, streamSid) {
     if (event.type === "error") {
       const msg = event?.error?.message || "sin mensaje";
       const code = event?.error?.code || "sin-codigo";
-
-      // 🔥 ESTA ES LA LÍNEA QUE VAS A VER SÍ O SÍ
       console.error(`🧠 OPENAI-ERROR: CODE=${code} MSG=${msg}`);
-
       return;
     }
 
     if (event.type === "response.audio.delta") {
       const call = calls.get(callSid);
-      if (!call) return;
+      if (!call || !call.twilioWs || call.twilioWs.readyState !== WebSocket.OPEN)
+        return;
 
       const audio = event.delta?.audio;
       if (!audio) return;
@@ -194,12 +235,17 @@ function connectOpenAI(callSid, streamSid) {
             media: { payload: audio },
           })
         );
-      } catch {}
+      } catch (err) {
+        console.error("🚨 Error enviando audio a Twilio:", err);
+      }
     }
 
     if (event.type === "response.completed") {
       const call = calls.get(callSid);
-      if (call) call.pendingResponse = false;
+      if (call) {
+        call.pendingResponse = false;
+        console.log(`✅ Respuesta completada para ${callSid}`);
+      }
     }
   });
 
