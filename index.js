@@ -1,6 +1,6 @@
 // ===============================================================
 // 📞 Voices Core - Voice Gateway v4 (Twilio + OpenAI Realtime)
-// Modo limpio: μ-law, VAD del servidor, sin commits manuales
+// Versión: una respuesta por llamada, VAD servidor, μ-law
 // ===============================================================
 
 const http = require("http");
@@ -15,7 +15,7 @@ if (!OPENAI_API_KEY) {
   console.warn("❌ Falta OPENAI_API_KEY en Render.");
 }
 
-// callSid -> { twilio, openai, streamSid, pending }
+// callSid -> { twilio, openai, streamSid, pending, hasResponded }
 const calls = new Map();
 
 // ---------------------------
@@ -84,18 +84,18 @@ wss.on("connection", (ws) => {
           openai: openAiWs,
           streamSid,
           pending: false,
+          hasResponded: false, // 👈 solo una respuesta por llamada (por ahora)
         });
         break;
 
       case "media": {
-        // Audio entrante del cliente
         const call = calls.get(callSid);
         if (!call || call.openai.readyState !== WebSocket.OPEN) return;
 
         const payload = data.media?.payload;
         if (!payload) return;
 
-        // Mandamos sólo append, el servidor maneja VAD y commit
+        // Solo mandamos audio de entrada al buffer
         try {
           call.openai.send(
             JSON.stringify({
@@ -107,9 +107,7 @@ wss.on("connection", (ws) => {
           console.error("🚨 Error enviando audio a OpenAI:", err);
         }
 
-        console.log(
-          `🎙 Evento Twilio: media (CallSid ${callSid})`
-        );
+        console.log(`🎙 Evento Twilio: media (CallSid ${callSid})`);
         break;
       }
 
@@ -152,8 +150,7 @@ function connectOpenAI(callSid, streamSid) {
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
           instructions:
-            "Eres el asistente de voz oficial de Voices Core. Eres bilingüe (es/en), saludas cordial, detectas idioma, pides nombre, teléfono y motivo de la llamada. Responde breve, humano y claro.",
-          // Activamos VAD del servidor (detección de silencio)
+            "Eres el asistente de voz oficial de Voices Core. Eres bilingüe (español/inglés), saludas cordial, detectas idioma, pides nombre, teléfono y motivo de la llamada. Responde breve, humano y claro.",
           turn_detection: {
             type: "server_vad",
             threshold: 0.5,
@@ -178,8 +175,6 @@ function connectOpenAI(callSid, streamSid) {
     console.log("🧠 Evento OpenAI:", type);
 
     const call = calls.get(callSid);
-
-    // Seguridad
     if (!call) return;
 
     // 1) Manejo de errores
@@ -187,16 +182,20 @@ function connectOpenAI(callSid, streamSid) {
       const msg = event?.error?.message || "sin mensaje";
       const code = event?.error?.code || "sin-codigo";
       console.error(`🧠 OPENAI-ERROR: CODE=${code} MSG=${msg}`);
-      call.pending = false;
+
+      // No tocamos pending si el error es "conversation_already_has_active_response"
+      if (code !== "conversation_already_has_active_response") {
+        call.pending = false;
+      }
       return;
     }
 
-    // 2) Cuando OpenAI detecta que dejaste de hablar → speech_stopped
+    // 2) VAD: el usuario terminó de hablar
     if (type === "input_audio_buffer.speech_stopped") {
       console.log("🧠 VAD: speech_stopped para", callSid);
 
-      // Si no hay respuesta pendiente, pedimos una
-      if (!call.pending) {
+      // Solo pedimos UNA respuesta por llamada (por ahora)
+      if (!call.pending && !call.hasResponded) {
         try {
           ws.send(
             JSON.stringify({
@@ -204,16 +203,22 @@ function connectOpenAI(callSid, streamSid) {
               response: {
                 modalities: ["audio", "text"],
                 instructions:
-                  "Responde de forma muy breve, clara, cordial y humana. Prioriza audio.",
+                  "Responde de forma muy breve, clara, cordial y humana. Prioriza audio. Saluda y presenta el servicio.",
               },
             })
           );
           call.pending = true;
+          call.hasResponded = true;
           console.log("🧠 response.create enviado para", callSid);
         } catch (err) {
           console.error("🚨 Error enviando response.create:", err);
           call.pending = false;
         }
+      } else {
+        console.log(
+          "⚠️ speech_stopped ignorado (pending o ya respondió) para",
+          callSid
+        );
       }
     }
 
@@ -250,8 +255,8 @@ function connectOpenAI(callSid, streamSid) {
       }
     }
 
-    // 5) Cuando la respuesta termina → liberamos pending
-    if (type === "response.completed") {
+    // 5) Respuesta completada → liberamos pending
+    if (type === "response.completed" || type === "response.done") {
       call.pending = false;
       console.log(`✅ Respuesta completada para ${callSid}`);
     }
