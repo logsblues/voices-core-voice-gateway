@@ -1,13 +1,13 @@
-// ============================
-// 📞 Voices Core - Voice Gateway v4 (Fase 2.2 - debug OpenAI errors)
-// Twilio Media Streams  <->  VoicesCore Gateway (Render)  <->  OpenAI Realtime
-// ============================
+// ===============================================================
+// 📞 Voices Core - Voice Gateway v4 (Con Twilio + OpenAI Realtime)
+// Fase: DEPURACIÓN PROFUNDA (con logging completo de errores)
+// ===============================================================
 
 const http = require("http");
 const WebSocket = require("ws");
 
 // ---------------------------
-// Configuración básica
+// Configuración
 // ---------------------------
 const PORT = process.env.PORT || 10000;
 
@@ -16,11 +16,10 @@ const OPENAI_REALTIME_MODEL =
   process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview";
 
 if (!OPENAI_API_KEY) {
-  console.warn("⚠️ Falta OPENAI_API_KEY en las variables de entorno de Render.");
+  console.warn("❌ Falta OPENAI_API_KEY en Render → no funcionará OpenAI.");
 }
 
-// Mapa en memoria para llamadas activas
-// callSid -> { twilioWs, openAiWs, streamSid, pendingResponse }
+// Mapa global para llamadas activas
 const calls = new Map();
 
 // ---------------------------
@@ -28,32 +27,34 @@ const calls = new Map();
 // ---------------------------
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("VoicesCore Voice Gateway v4 is running.\n");
+  res.end("Voices Core - Voice Gateway v4 is running.\n");
 });
 
-// Servidor WebSocket sobre HTTP
+// ---------------------------
+// WebSocket Server
+// ---------------------------
 const wss = new WebSocket.Server({ noServer: true });
 
 // ---------------------------
-// Upgrade HTTP -> WebSocket
+// Upgrade HTTP → WebSocket
 // ---------------------------
-server.on("upgrade", (request, socket, head) => {
-  const { url } = request;
+server.on("upgrade", (req, socket, head) => {
+  const { url } = req;
   console.log("🔁 HTTP upgrade solicitado. URL:", url);
 
   if (url === "/twilio-stream") {
     console.log("✅ Aceptando conexión WS para /twilio-stream");
-    wss.handleUpgrade(request, socket, head, (ws) => {
-      wss.emit("connection", ws, request);
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req);
     });
   } else {
-    console.log("❌ Rechazando upgrade (ruta no válida):", url);
+    console.log("❌ Rechazando upgrade WS (ruta inválida):", url);
     socket.destroy();
   }
 });
 
 // ---------------------------
-// Conexión desde Twilio
+// TWILIO → NUEVA CONEXIÓN WS
 // ---------------------------
 wss.on("connection", (ws, request) => {
   console.log("🌐 Nueva conexión WebSocket desde Twilio");
@@ -62,220 +63,211 @@ wss.on("connection", (ws, request) => {
   let streamSid = null;
 
   ws.on("message", (msg) => {
-    let data;
+    let data = null;
     try {
       data = JSON.parse(msg.toString());
     } catch (err) {
-      console.error("🚨 Error parseando mensaje Twilio:", err);
+      console.error("🚨 Error parseando JSON de Twilio:", err);
       return;
     }
 
     const event = data.event;
 
-    switch (event) {
-      case "connected": {
-        console.log("🔗 Evento Twilio: connected");
-        break;
-      }
+    // -------------------------
+    // EVENTOS DE TWILIO
+    // -------------------------
 
-      case "start": {
-        callSid = data.start?.callSid;
-        streamSid = data.start?.streamSid;
-        console.log("▶️ Llamada iniciada. CallSid:", callSid, "StreamSid:", streamSid);
+    if (event === "connected") {
+      console.log("🔗 Evento Twilio: connected");
+    }
 
-        // Crear conexión con OpenAI para esta llamada
-        const openAiWs = connectOpenAiRealtime(callSid, streamSid);
+    if (event === "start") {
+      callSid = data.start.callSid;
+      streamSid = data.start.streamSid;
 
-        // Guardar en el mapa
-        calls.set(callSid, {
-          twilioWs: ws,
-          openAiWs,
-          streamSid,
-          pendingResponse: false,
-        });
+      console.log(`▶️ Llamada iniciada. CallSid: ${callSid} StreamSid: ${streamSid}`);
 
-        break;
-      }
+      // Abrir WebSocket con OpenAI
+      const openAiWs = connectOpenAI(callSid, streamSid);
 
-      case "media": {
-        console.log("🎙 Evento Twilio: media");
-        const payload = data.media?.payload;
-        if (!payload || !callSid) return;
+      // Guardar llamada
+      calls.set(callSid, {
+        twilioWs: ws,
+        openAiWs,
+        streamSid,
+        pendingResponse: false,
+      });
+    }
 
-        const call = calls.get(callSid);
-        if (!call || !call.openAiWs || call.openAiWs.readyState !== WebSocket.OPEN) {
-          return;
-        }
+    if (event === "media") {
+      console.log("🎙 Evento Twilio: media");
 
-        // Enviar audio a OpenAI Realtime
-        try {
-          // 1) Enviamos el audio (g711_ulaw base64)
+      const call = calls.get(callSid);
+      if (!call || !call.openAiWs) return;
+
+      const payload = data.media.payload;
+      if (!payload) return;
+
+      try {
+        // Enviar audio g711_ulaw a OpenAI
+        call.openAiWs.send(
+          JSON.stringify({
+            type: "input_audio_buffer.append",
+            audio: payload,
+          })
+        );
+
+        // Confirmar bloque
+        call.openAiWs.send(
+          JSON.stringify({
+            type: "input_audio_buffer.commit",
+          })
+        );
+
+        // Pedir respuesta
+        if (!call.pendingResponse) {
+          call.pendingResponse = true;
+
           call.openAiWs.send(
             JSON.stringify({
-              type: "input_audio_buffer.append",
-              audio: payload,
+              type: "response.create",
+              response: {
+                modalities: ["audio"],
+                instructions:
+                  "Responde al usuario con una voz natural, breve y cordial.",
+              },
             })
           );
-
-          // 2) Confirmamos que terminamos este bloque
-          call.openAiWs.send(
-            JSON.stringify({
-              type: "input_audio_buffer.commit",
-            })
-          );
-
-          // 3) Pedimos a OpenAI que genere una respuesta (una a la vez)
-          if (!call.pendingResponse) {
-            call.pendingResponse = true;
-
-            call.openAiWs.send(
-              JSON.stringify({
-                type: "response.create",
-                response: {
-                  modalities: ["audio"],
-                  instructions: "Responde al usuario de manera breve y natural.",
-                },
-              })
-            );
-          }
-        } catch (err) {
-          console.error("🚨 Error enviando audio/response.create a OpenAI:", err);
         }
-
-        break;
+      } catch (err) {
+        console.error("🚨 Error enviando audio a OpenAI:", err);
       }
+    }
 
-      case "mark": {
-        console.log("🔖 Marca Twilio:", data.mark?.name);
-        break;
-      }
+    if (event === "mark") {
+      console.log("🔖 Marca Twilio:", data.mark.name);
+    }
 
-      case "stop": {
-        console.log("⏹ Evento stop recibido. CallSid:", callSid);
-        cleanupCall(callSid);
-        break;
-      }
-
-      default:
-        console.log("❓ Evento Twilio desconocido:", event);
+    if (event === "stop") {
+      console.log("⏹ Evento stop recibido. CallSid:", callSid);
+      cleanupCall(callSid);
     }
   });
 
   ws.on("close", () => {
     console.log("🔌 Conexión WebSocket Twilio cerrada");
-    if (callSid) {
-      cleanupCall(callSid);
-    }
+    cleanupCall(callSid);
   });
 
   ws.on("error", (err) => {
-    console.error("⚠️ Error WebSocket Twilio:", err);
+    console.error("⚠️ Error WS Twilio:", err);
   });
 });
 
-// ---------------------------
-// Conexión a OpenAI Realtime
-// ---------------------------
-function connectOpenAiRealtime(callSid, streamSid) {
-  if (!OPENAI_API_KEY) {
-    console.error("❌ No se puede conectar a OpenAI: falta OPENAI_API_KEY");
-    return null;
-  }
-
-  const url = `wss://api.openai.com/v1/realtime?model=${OPENAI_REALTIME_MODEL}`;
-
+// ======================================================
+// FUNCION: Crear conexión WebSocket con OpenAI Realtime
+// ======================================================
+function connectOpenAI(callSid, streamSid) {
   console.log("🧠 Abriendo WS a OpenAI Realtime para CallSid:", callSid);
 
-  const openAiWs = new WebSocket(url, {
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "OpenAI-Beta": "realtime=v1",
-    },
-  });
+  const ws = new WebSocket(
+    `wss://api.openai.com/v1/realtime?model=${OPENAI_REALTIME_MODEL}`,
+    {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1",
+      },
+    }
+  );
 
-  openAiWs.on("open", () => {
+  ws.on("open", () => {
     console.log("🧠 OpenAI WS conectado para CallSid:", callSid);
 
-    // Prompt maestro básico – luego metemos el v4 completo
+    // --------------------
+    // PROMPT BASE
+    // --------------------
     const instructions = `
-Eres el asistente de voz de Voices Core.
-Eres totalmente bilingüe (español e inglés).
-Respondes MUY natural y breve.
-Tu objetivo en cada llamada:
+Eres el asistente de voz oficial de Voices Core.
+Hablas español e inglés de forma natural.
+Recibes llamadas entrantes de clientes.
+Tu misión:
 1. Saludar cordialmente.
-2. Detectar en qué idioma habla el cliente.
-3. Pedir y confirmar: nombre, número de teléfono y correo electrónico.
-4. Preguntar por el motivo principal de la llamada (venta, soporte, cita, etc.).
-5. Resumir la necesidad del cliente en una frase corta.
-6. Preguntar si desea hablar con un agente humano ahora o agendar una llamada.
-Nunca inventes información de la empresa; si no sabes algo, di que lo confirmará un agente humano.
+2. Detectar idioma del cliente.
+3. Pedir nombre, teléfono y email.
+4. Preguntar motivo de la llamada.
+5. Ofrecer transferir a un agente humano o agendar.
+
+Habla siempre de forma breve, humana y clara.
+No inventes información de la empresa.
     `.trim();
 
-    const sessionUpdate = {
-      type: "session.update",
-      session: {
-        instructions,
-        input_audio_format: "g711_ulaw",
-        output_audio_format: "g711_ulaw",
-        modalities: ["audio"],
-        voice: "alloy",
-      },
-    };
-
-    try {
-      openAiWs.send(JSON.stringify(sessionUpdate));
-    } catch (err) {
-      console.error("🚨 Error enviando session.update a OpenAI:", err);
-    }
+    // Configurar sesión
+    ws.send(
+      JSON.stringify({
+        type: "session.update",
+        session: {
+          instructions,
+          voice: "alloy",
+          input_audio_format: "g711_ulaw",
+          output_audio_format: "g711_ulaw",
+          modalities: ["audio"],
+        },
+      })
+    );
   });
 
-  openAiWs.on("message", (msg) => {
+  ws.on("message", (data) => {
     let event;
     try {
-      event = JSON.parse(msg.toString());
+      event = JSON.parse(data.toString());
     } catch (err) {
-      console.error("🚨 Error parseando mensaje de OpenAI:", err);
+      console.error("🧠 Error parseando mensaje de OpenAI:", err);
       return;
     }
 
-    // 🔍 Log básico del tipo
     console.log("🧠 Evento OpenAI:", event.type);
 
-    // 👉 SI HAY ERROR, LOG COMPLETO
+    // ------------------------
+    // LOG COMPLETO DEL ERROR
+    // ------------------------
     if (event.type === "error") {
-      console.error("🧠 OpenAI error DETALLE:\n", JSON.stringify(event, null, 2));
+      console.error(
+        "🧠 OpenAI error DETALLE:\n",
+        JSON.stringify(event, null, 2)
+      );
       return;
     }
 
-    // Manejo de audio incremental
+    // ------------------------
+    // AUDIO DE RESPUESTA
+    // ------------------------
     if (event.type === "response.audio.delta") {
       const call = calls.get(callSid);
-      if (!call || call.twilioWs.readyState !== WebSocket.OPEN) return;
+      if (!call) return;
 
       const audioB64 =
-        (event.delta && event.delta.audio) ||
-        event.delta ||
-        event.audio ||
-        null;
+        event.delta?.audio || event.delta || event.audio || null;
 
       if (!audioB64) return;
 
-      const frame = {
-        event: "media",
-        streamSid: call.streamSid,
-        media: {
-          payload: audioB64, // asumimos g711_ulaw base64
-        },
-      };
-
       try {
-        call.twilioWs.send(JSON.stringify(frame));
+        call.twilioWs.send(
+          JSON.stringify({
+            event: "media",
+            streamSid: call.streamSid,
+            media: {
+              payload: audioB64,
+            },
+          })
+        );
       } catch (err) {
         console.error("🚨 Error enviando audio a Twilio:", err);
       }
     }
 
-    // Cuando la respuesta termina, liberamos el lock
+    // ------------------------
+    // RESPUESTA COMPLETA
+    // ------------------------
     if (event.type === "response.completed") {
       const call = calls.get(callSid);
       if (call) {
@@ -284,20 +276,20 @@ Nunca inventes información de la empresa; si no sabes algo, di que lo confirmar
     }
   });
 
-  openAiWs.on("close", () => {
+  ws.on("close", () => {
     console.log("🔌 OpenAI WS cerrado para CallSid:", callSid);
   });
 
-  openAiWs.on("error", (err) => {
-    console.error("⚠️ Error WebSocket OpenAI:", err);
+  ws.on("error", (err) => {
+    console.error("⚠️ Error WS OpenAI:", err);
   });
 
-  return openAiWs;
+  return ws;
 }
 
-// ---------------------------
-// Limpieza de llamadas
-// ---------------------------
+// ==================================================
+// FUNCIÓN: LIMPIAR LLAMADA
+// ==================================================
 function cleanupCall(callSid) {
   if (!callSid) return;
 
@@ -307,28 +299,23 @@ function cleanupCall(callSid) {
   console.log("🧹 Limpiando recursos de CallSid:", callSid);
 
   try {
-    if (call.openAiWs && call.openAiWs.readyState === WebSocket.OPEN) {
+    if (call.openAiWs?.readyState === WebSocket.OPEN) {
       call.openAiWs.close();
     }
-  } catch (err) {
-    console.error("⚠️ Error cerrando WS OpenAI:", err);
-  }
+  } catch {}
 
   try {
-    if (call.twilioWs && call.twilioWs.readyState === WebSocket.OPEN) {
+    if (call.twilioWs?.readyState === WebSocket.OPEN) {
       call.twilioWs.close();
     }
-  } catch (err) {
-    console.error("⚠️ Error cerrando WS Twilio:", err);
-  }
+  } catch {}
 
   calls.delete(callSid);
 }
 
-// ---------------------------
-// Iniciar servidor HTTP
-// ---------------------------
+// ==================================================
+// INICIAR SERVIDOR
+// ==================================================
 server.listen(PORT, () => {
   console.log(`🚀 Voice Gateway v4 escuchando en puerto ${PORT}`);
 });
-
