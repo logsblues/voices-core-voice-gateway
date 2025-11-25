@@ -1,6 +1,6 @@
 // ===============================================================
 // 📞 Voices Core - Voice Gateway v4 (Twilio + OpenAI Realtime)
-// Versión: LOG COMPLETO de mensajes de OpenAI para depuración
+// Versión: LOG de errores de OpenAI simplificado (mensaje claro)
 // ===============================================================
 
 const http = require("http");
@@ -222,19 +222,18 @@ No inventes información de la empresa.
       return;
     }
 
-    // 🔍 Log completo del mensaje recibido
-    console.log("🧠 Mensaje OpenAI:", JSON.stringify(event, null, 2));
+    // 🔍 Log básico del tipo de evento
+    console.log("🧠 Evento OpenAI:", event.type);
 
-    // Si es error, lo mostramos y no seguimos
+    // ⛔ Si es error, mostrar mensaje claro y salir
     if (event.type === "error") {
-      console.error(
-        "🧠 OpenAI error DETALLE:\n",
-        JSON.stringify(event, null, 2)
-      );
+      const msg = event?.error?.message || "Error desconocido de OpenAI";
+      const code = event?.error?.code || "sin-codigo";
+      console.error("🧠 OpenAI ERROR:", code, "-", msg);
       return;
     }
 
-    // Audio incremental
+    // 🔊 Audio incremental desde OpenAI hacia Twilio
     if (event.type === "response.audio.delta") {
       const call = calls.get(callSid);
       if (!call || call.twilioWs.readyState !== WebSocket.OPEN) return;
@@ -259,7 +258,7 @@ No inventes información de la empresa.
       }
     }
 
-    // Cuando termina una respuesta, liberamos el candado
+    // ✅ Cuando termina una respuesta, liberamos el candado
     if (event.type === "response.completed") {
       const call = calls.get(callSid);
       if (call) {
