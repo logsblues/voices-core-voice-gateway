@@ -1,71 +1,97 @@
-// index.js - Voices Core Voice Gateway (v1)
-// Servidor HTTP + WebSocket para Twilio Media Streams
-// FASE 1: SOLO probar que Twilio se conecta por WSS y vemos los eventos en los logs.
+// ============================
+// 📞 Voices Core - Voice Gateway v4
+// WebSocket Gateway para Twilio Media Streams
+// ============================
 
-const http = require("http");
-const WebSocket = require("ws");
+import http from "http";
+import WebSocket, { WebSocketServer } from "ws";
 
+// ---------------------------
+// Configuración del servidor
+// ---------------------------
 const PORT = process.env.PORT || 10000;
 
-// Servidor HTTP simple (Render requiere que escuchemos en HTTP)
+// Crear servidor HTTP base (necesario para upgrade → WebSocket)
 const server = http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Voices Core Voice Gateway is running.\n");
+  res.writeHead(200);
+  res.end("VoicesCore Voice Gateway is running.");
 });
 
-// Creamos un servidor WebSocket montado sobre ese HTTP server
-const wss = new WebSocket.Server({ noServer: true });
+// Crear WebSocket Server (sin puerto, se conecta al HTTP server)
+const wss = new WebSocketServer({ noServer: true });
 
-// Manejo de upgrade HTTP -> WebSocket
+// ---------------------------------------
+// 1️⃣ Manejo del Upgrade (HTTP → WS)
+// ---------------------------------------
 server.on("upgrade", (request, socket, head) => {
   const { url } = request;
+  console.log("🔁 HTTP upgrade solicitado. URL:", url);
 
-  // Solo aceptamos la ruta /twilio-stream
+  // Solo aceptamos esta ruta EXACTA
   if (url === "/twilio-stream") {
+    console.log("✅ Aceptando conexión WS para Twilio Stream");
+
     wss.handleUpgrade(request, socket, head, (ws) => {
       wss.emit("connection", ws, request);
     });
   } else {
+    console.log("❌ Rechazando upgrade (ruta no válida):", url);
     socket.destroy();
   }
 });
 
-// Lógica cuando Twilio se conecta a /twilio-stream
+// ---------------------------------------
+// 2️⃣ Conexión WebSocket establecida
+// ---------------------------------------
 wss.on("connection", (ws, request) => {
-  console.log("✅ Nueva conexión WebSocket desde Twilio");
+  console.log("🌐 Nueva conexión WebSocket desde Twilio");
 
-  ws.on("message", (data) => {
+  // Mensaje recibido desde Twilio
+  ws.on("message", (msg) => {
     try {
-      const msg = JSON.parse(data.toString());
-      console.log("📩 Evento Twilio:", msg.event);
+      const data = JSON.parse(msg.toString());
+      console.log("📩 Evento Twilio:", data.event);
 
-      if (msg.event === "start") {
-        console.log("▶️ Llamada iniciada. CallSid:", msg.start.callSid);
-        console.log("   Desde:", msg.start.from, "→ Hacia:", msg.start.to);
-      }
+      switch (data.event) {
+        case "start":
+          console.log("▶️ Llamada iniciada. CallSid:", data.start?.callSid);
+          break;
 
-      if (msg.event === "media") {
-        // Aquí viene el audio del cliente en base64 (μ-law)
-        // En esta FASE 1 solo lo reconocemos y no hacemos nada.
-        // Más adelante lo mandaremos a OpenAI Realtime.
-        // const audioBase64 = msg.media.payload;
-      }
+        case "media":
+          // Aquí recibimos audio base64
+          // console.log("🎙 Audio recibido (media chunk)");
+          break;
 
-      if (msg.event === "stop") {
-        console.log("⏹ Llamada finalizada");
-        ws.close();
+        case "mark":
+          console.log("🔖 Marca:", data.mark?.name);
+          break;
+
+        case "stop":
+          console.log("⏹ Llamada finalizada.");
+          break;
+
+        default:
+          console.log("❓ Evento desconocido:", data.event);
       }
-    } catch (e) {
-      console.error("❌ Error parseando mensaje:", e);
+    } catch (err) {
+      console.error("🚨 Error al procesar mensaje:", err);
     }
   });
 
+  // Manejo de cierre de conexión
   ws.on("close", () => {
     console.log("🔌 Conexión WebSocket cerrada");
   });
+
+  ws.on("error", (err) => {
+    console.error("⚠️ Error WS:", err);
+  });
 });
 
-// Iniciar servidor HTTP
+// ---------------------------------------
+// 3️⃣ Inicializar servidor HTTP
+// ---------------------------------------
 server.listen(PORT, () => {
   console.log(`🚀 Voice Gateway escuchando en puerto ${PORT}`);
 });
+
