@@ -1,7 +1,6 @@
 // ============================
-// 📞 Voices Core - Voice Gateway v4 (Fase 2.1)
+// 📞 Voices Core - Voice Gateway v4 (Fase 2.2 - debug OpenAI errors)
 // Twilio Media Streams  <->  VoicesCore Gateway (Render)  <->  OpenAI Realtime
-// Con response.create para que la IA responda
 // ============================
 
 const http = require("http");
@@ -125,7 +124,7 @@ wss.on("connection", (ws, request) => {
             })
           );
 
-          // 3) Pedimos a OpenAI que genere una respuesta
+          // 3) Pedimos a OpenAI que genere una respuesta (una a la vez)
           if (!call.pendingResponse) {
             call.pendingResponse = true;
 
@@ -239,15 +238,18 @@ Nunca inventes información de la empresa; si no sabes algo, di que lo confirmar
       return;
     }
 
-    // Log básico para ver qué llega
+    // 🔍 Log básico del tipo
     console.log("🧠 Evento OpenAI:", event.type);
+
+    // 👉 SI HAY ERROR, LOG COMPLETO
+    if (event.type === "error") {
+      console.error("🧠 OpenAI error DETALLE:\n", JSON.stringify(event, null, 2));
+      return;
+    }
 
     // Manejo de audio incremental
     if (event.type === "response.audio.delta") {
-      const call = Array.from(calls.entries()).find(
-        ([id, c]) => id === callSid
-      )?.[1];
-
+      const call = calls.get(callSid);
       if (!call || call.twilioWs.readyState !== WebSocket.OPEN) return;
 
       const audioB64 =
@@ -329,3 +331,4 @@ function cleanupCall(callSid) {
 server.listen(PORT, () => {
   console.log(`🚀 Voice Gateway v4 escuchando en puerto ${PORT}`);
 });
+
