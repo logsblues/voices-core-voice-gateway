@@ -1,6 +1,6 @@
 // ===============================================================
 // 📞 Voices Core - Voice Gateway v4 (Twilio + OpenAI Realtime)
-// Versión: acumula audio antes de commit (soluciona buffer too small)
+// Versión: commits cada 50 frames (~1s) sin pendingResponse
 // ===============================================================
 
 const http = require("http");
@@ -9,6 +9,7 @@ const WebSocket = require("ws");
 const PORT = process.env.PORT || 10000;
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+// Modelo realtime (puedes cambiarlo si usas otro)
 const OPENAI_REALTIME_MODEL =
   process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview";
 
@@ -16,7 +17,7 @@ if (!OPENAI_API_KEY) {
   console.warn("❌ Falta OPENAI_API_KEY en Render.");
 }
 
-// callSid -> { twilioWs, openAiWs, streamSid, pendingResponse, framesAccumulated }
+// callSid -> { twilioWs, openAiWs, streamSid, framesAccumulated }
 const calls = new Map();
 
 // ---------------------------
@@ -87,7 +88,6 @@ wss.on("connection", (ws) => {
           twilioWs: ws,
           openAiWs,
           streamSid,
-          pendingResponse: false,
           framesAccumulated: 0,
         });
         break;
@@ -114,42 +114,36 @@ wss.on("connection", (ws) => {
             })
           );
 
-          // 2) Acumulamos conteo de frames
+          // 2) Aumentamos contador de frames
           call.framesAccumulated = (call.framesAccumulated || 0) + 1;
           console.log(
             `🔊 Frames acumulados para ${callSid}: ${call.framesAccumulated}`
           );
 
-          // 3) Solo si:
-          //    - No hay respuesta pendiente
-          //    - Ya tenemos >= 5 frames (≈100ms de audio)
-          //    => hacemos commit + response.create
-          if (!call.pendingResponse && call.framesAccumulated >= 5) {
+          // 3) Cada 50 frames (~1s de audio), hacemos commit + response.create
+          if (call.framesAccumulated % 50 === 0) {
             console.log(
-              `✅ Enviando commit + response.create para ${callSid} (frames=${call.framesAccumulated})`
+              `✅ Commit + response.create para ${callSid} (frames=${call.framesAccumulated})`
             );
 
-            // Commit del buffer
+            // Commit del buffer actual
             call.openAiWs.send(
               JSON.stringify({
                 type: "input_audio_buffer.commit",
               })
             );
 
-            // Pedimos respuesta
+            // Pedimos una respuesta en audio
             call.openAiWs.send(
               JSON.stringify({
                 type: "response.create",
                 response: {
                   modalities: ["audio"],
                   instructions:
-                    "Responde de manera breve, clara, humana y cordial al usuario.",
+                    "Responde de forma breve, clara, humana y cordial al usuario.",
                 },
               })
             );
-
-            call.pendingResponse = true;
-            call.framesAccumulated = 0;
           }
         } catch (err) {
           console.error("🚨 Error enviando audio/commit/response → OpenAI:", err);
@@ -191,7 +185,7 @@ function connectOpenAI(callSid, streamSid) {
         type: "session.update",
         session: {
           instructions:
-            "Eres un asistente de voz de Voices Core. Eres bilingüe (es/en), cordial y directo. Saluda, detecta idioma, pide nombre, teléfono y motivo de la llamada.",
+            "Eres un asistente de voz de Voices Core. Eres bilingüe (español/inglés), cordial y directo. Saluda, detecta idioma, pide nombre, teléfono y motivo de la llamada. Responde siempre corto y humano.",
           voice: "alloy",
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
@@ -237,14 +231,6 @@ function connectOpenAI(callSid, streamSid) {
         );
       } catch (err) {
         console.error("🚨 Error enviando audio a Twilio:", err);
-      }
-    }
-
-    if (event.type === "response.completed") {
-      const call = calls.get(callSid);
-      if (call) {
-        call.pendingResponse = false;
-        console.log(`✅ Respuesta completada para ${callSid}`);
       }
     }
   });
