@@ -1,6 +1,6 @@
 // ===============================================================
 // 📞 Voices Core - Voice Gateway v4 (Twilio + OpenAI Realtime)
-// Versión: commits cada 50 frames (~1s) sin pendingResponse
+// Versión: CORREGIDA — soporta modalities ["audio","text"]
 // ===============================================================
 
 const http = require("http");
@@ -9,7 +9,6 @@ const WebSocket = require("ws");
 const PORT = process.env.PORT || 10000;
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-// Modelo realtime (puedes cambiarlo si usas otro)
 const OPENAI_REALTIME_MODEL =
   process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview";
 
@@ -106,7 +105,7 @@ wss.on("connection", (ws) => {
         if (!payload) return;
 
         try {
-          // 1) Mandamos el frame de audio a OpenAI (g711_ulaw base64)
+          // 1) Mandamos el frame de audio a OpenAI
           call.openAiWs.send(
             JSON.stringify({
               type: "input_audio_buffer.append",
@@ -114,31 +113,31 @@ wss.on("connection", (ws) => {
             })
           );
 
-          // 2) Aumentamos contador de frames
+          // 2) Acumulamos frames
           call.framesAccumulated = (call.framesAccumulated || 0) + 1;
           console.log(
             `🔊 Frames acumulados para ${callSid}: ${call.framesAccumulated}`
           );
 
-          // 3) Cada 50 frames (~1s de audio), hacemos commit + response.create
+          // 3) Cada 50 frames → commit + response.create
           if (call.framesAccumulated % 50 === 0) {
             console.log(
               `✅ Commit + response.create para ${callSid} (frames=${call.framesAccumulated})`
             );
 
-            // Commit del buffer actual
+            // Commit del audio
             call.openAiWs.send(
               JSON.stringify({
                 type: "input_audio_buffer.commit",
               })
             );
 
-            // Pedimos una respuesta en audio
+            // Solicitar respuesta del modelo
             call.openAiWs.send(
               JSON.stringify({
                 type: "response.create",
                 response: {
-                  modalities: ["audio"],
+                  modalities: ["audio", "text"],
                   instructions:
                     "Responde de forma breve, clara, humana y cordial al usuario.",
                 },
@@ -146,7 +145,7 @@ wss.on("connection", (ws) => {
             );
           }
         } catch (err) {
-          console.error("🚨 Error enviando audio/commit/response → OpenAI:", err);
+          console.error("🚨 Error enviando audio a OpenAI:", err);
         }
         break;
 
@@ -185,11 +184,11 @@ function connectOpenAI(callSid, streamSid) {
         type: "session.update",
         session: {
           instructions:
-            "Eres un asistente de voz de Voices Core. Eres bilingüe (español/inglés), cordial y directo. Saluda, detecta idioma, pide nombre, teléfono y motivo de la llamada. Responde siempre corto y humano.",
+            "Eres un asistente de voz de Voices Core. Eres bilingüe (español/inglés). Saluda, detecta idioma, pide nombre, teléfono y motivo de la llamada. Responde corto, humano y cálido.",
           voice: "alloy",
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
-          modalities: ["audio"],
+          modalities: ["audio", "text"],
         },
       })
     );
@@ -213,6 +212,7 @@ function connectOpenAI(callSid, streamSid) {
       return;
     }
 
+    // Respuesta en audio
     if (event.type === "response.audio.delta") {
       const call = calls.get(callSid);
       if (!call || !call.twilioWs || call.twilioWs.readyState !== WebSocket.OPEN)
