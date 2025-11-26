@@ -23,9 +23,35 @@ console.log("🧠 Usando modelo Realtime:", MODEL);
 const calls = new Map();
 
 // ---------------------------
-// HTTP Server
+// HTTP Server (CORS + /health)
 // ---------------------------
 const server = http.createServer((req, res) => {
+  const { method, url } = req;
+
+  // ✅ CORS básico para que el panel en Lovable pueda hacer fetch
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+
+  if (method === "OPTIONS") {
+    res.writeHead(200);
+    return res.end();
+  }
+
+  // ✅ Endpoint de salud para el panel
+  if (url === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(
+      JSON.stringify({
+        status: "ok",
+        service: "voices-core-voice-gateway",
+        model: MODEL,
+        timestamp: new Date().toISOString(),
+      })
+    );
+  }
+
+  // Respuesta por defecto (root u otras rutas HTTP simples)
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("Voices Core - Voice Gateway v4 running.\n");
 });
@@ -238,7 +264,6 @@ function connectOpenAI(callSid, streamSid) {
 
     // 4) Audio generado por OpenAI → reenvío a Twilio
     if (type === "response.audio.delta") {
-      // ⬅️ AQUÍ ESTABA EL PROBLEMA: el audio viene en `event.delta` (string base64)
       const audio = event.delta;
 
       if (!audio || typeof audio !== "string") {
