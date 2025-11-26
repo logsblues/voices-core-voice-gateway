@@ -238,12 +238,12 @@ function connectOpenAI(callSid, streamSid) {
 
     // 4) Audio generado por OpenAI → reenvío a Twilio
     if (type === "response.audio.delta") {
-      const audio = event.delta?.audio;
+      // ⬅️ AQUÍ ESTABA EL PROBLEMA: el audio viene en `event.delta` (string base64)
+      const audio = event.delta;
 
-      if (!audio) {
-        // DEBUG: ver el evento crudo cuando viene vacío
+      if (!audio || typeof audio !== "string") {
         console.log(
-          "🔇 response.audio.delta sin audio. Evento:",
+          "🔇 response.audio.delta sin audio válido. Evento:",
           JSON.stringify(event)
         );
         return;
