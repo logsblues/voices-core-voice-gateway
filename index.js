@@ -1,6 +1,6 @@
 // ===============================================================
 // 📞 Voices Core - Voice Gateway v4 (Twilio + OpenAI Realtime)
-// Versión: usa config de Lovable por número de teléfono
+// Versión: conversación simple, VAD servidor, μ-law
 // ===============================================================
 
 const http = require("http");
@@ -13,76 +13,26 @@ const MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview";
 
 if (!OPENAI_API_KEY) {
   console.warn("❌ Falta OPENAI_API_KEY en Render.");
+} else {
+  console.log("✅ OPENAI_API_KEY configurada.");
 }
 
-// 🔹 NUEVAS VARIABLES DE ENTORNO (ya creaste VOICE_AGENT_CONFIG_BASE_URL y VOICE_GATEWAY_TOKEN)
-const VOICE_AGENT_CONFIG_BASE_URL = process.env.VOICE_AGENT_CONFIG_BASE_URL;
-const VOICE_GATEWAY_TOKEN = process.env.VOICE_GATEWAY_TOKEN;
-// Opcional: número por defecto si Twilio no manda "to"
-const DEFAULT_AGENT_PHONE = process.env.DEFAULT_AGENT_PHONE || null;
+console.log("🧠 Usando modelo Realtime:", MODEL);
 
-if (!VOICE_AGENT_CONFIG_BASE_URL || !VOICE_GATEWAY_TOKEN) {
-  console.warn("⚠️ Falta VOICE_AGENT_CONFIG_BASE_URL o VOICE_GATEWAY_TOKEN en Render.");
-}
-
-// callSid -> { twilio, openai, streamSid, pending, hasResponded, agentConfig }
+// callSid -> { twilio, openai, streamSid, pending, hasResponded }
 const calls = new Map();
 
-// --------------------------------------------------
-// 🔹 Helper: pedir config de agente a Lovable por teléfono
-// --------------------------------------------------
-async function fetchAgentConfigByPhone(phone) {
-  try {
-    if (!VOICE_AGENT_CONFIG_BASE_URL || !VOICE_GATEWAY_TOKEN) {
-      console.warn("⚠️ No hay config para voice-agent-config; usando defaults locales.");
-      return null;
-    }
-
-    const base = VOICE_AGENT_CONFIG_BASE_URL.replace(/\/$/, "");
-    const url = `${base}/voice-agent-config/by-phone?phone=${encodeURIComponent(
-      phone
-    )}`;
-
-    console.log("🌐 Pidiendo config de agente a:", url);
-
-    const res = await fetch(url, {
-      method: "GET",
-      headers: {
-        "x-voice-gateway-token": VOICE_GATEWAY_TOKEN,
-      },
-    });
-
-    if (!res.ok) {
-      const text = await res.text();
-      console.error(
-        "🚨 Error al obtener config de agente:",
-        res.status,
-        res.statusText,
-        text
-      );
-      return null;
-    }
-
-    const json = await res.json();
-    console.log("✅ Config de agente recibida:", json.id, json.name);
-    return json;
-  } catch (err) {
-    console.error("🚨 fetchAgentConfigByPhone falló:", err);
-    return null;
-  }
-}
-
-// --------------------------------------------------
-// 🌐 HTTP Server básico
-// --------------------------------------------------
+// ---------------------------
+// HTTP Server
+// ---------------------------
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("Voices Core - Voice Gateway v4 running.\n");
 });
 
-// --------------------------------------------------
-// 🔁 Upgrade HTTP → WebSocket
-// --------------------------------------------------
+// ---------------------------
+// Upgrade HTTP → WebSocket
+// ---------------------------
 const wss = new WebSocket.Server({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
@@ -100,9 +50,9 @@ server.on("upgrade", (req, socket, head) => {
   }
 });
 
-// --------------------------------------------------
-// 📞 TWILIO → Nueva conexión WS
-// --------------------------------------------------
+// ---------------------------
+// TWILIO → NUEVA CONEXIÓN WS
+// ---------------------------
 wss.on("connection", (ws) => {
   console.log("🌐 Nueva conexión WebSocket desde Twilio");
 
@@ -129,39 +79,17 @@ wss.on("connection", (ws) => {
         callSid = data.start.callSid;
         streamSid = data.start.streamSid;
 
-        // Twilio puede mandar el número destino en data.start.to
-        const toNumber =
-          data.start?.to ||
-          DEFAULT_AGENT_PHONE; // fallback si no viene en el payload
+        console.log(`▶️ Llamada iniciada: ${callSid} (StreamSid: ${streamSid})`);
 
-        console.log(
-          `▶️ Llamada iniciada: ${callSid} (StreamSid: ${streamSid}) To=${toNumber}`
-        );
+        const openAiWs = connectOpenAI(callSid, streamSid);
 
-        // Hacemos la llamada async sin bloquear
-        (async () => {
-          let agentConfig = null;
-
-          if (toNumber) {
-            agentConfig = await fetchAgentConfigByPhone(toNumber);
-          } else {
-            console.warn(
-              "⚠️ No se recibió teléfono en evento start y no hay DEFAULT_AGENT_PHONE; usando config local por defecto."
-            );
-          }
-
-          const openAiWs = connectOpenAI(callSid, streamSid, agentConfig);
-
-          calls.set(callSid, {
-            twilio: ws,
-            openai: openAiWs,
-            streamSid,
-            pending: false,
-            hasResponded: false,
-            agentConfig,
-          });
-        })();
-
+        calls.set(callSid, {
+          twilio: ws,
+          openai: openAiWs,
+          streamSid,
+          pending: false,
+          hasResponded: false, // solo una respuesta por llamada (por ahora)
+        });
         break;
 
       case "media": {
@@ -171,7 +99,7 @@ wss.on("connection", (ws) => {
         const payload = data.media?.payload;
         if (!payload) return;
 
-        // Mandamos audio de entrada a OpenAI
+        // Mandamos audio de entrada al buffer de OpenAI
         try {
           call.openai.send(
             JSON.stringify({
@@ -183,6 +111,7 @@ wss.on("connection", (ws) => {
           console.error("🚨 Error enviando audio a OpenAI:", err);
         }
 
+        // Log básico para saber que llega audio de Twilio
         console.log(`🎙 Evento Twilio: media (CallSid ${callSid})`);
         break;
       }
@@ -200,10 +129,10 @@ wss.on("connection", (ws) => {
   ws.on("close", () => cleanupCall(callSid));
 });
 
-// --------------------------------------------------
-// 🧠 Conexión con OpenAI Realtime
-// --------------------------------------------------
-function connectOpenAI(callSid, streamSid, agentConfig) {
+// ---------------------------
+// OPENAI CONNECTION
+// ---------------------------
+function connectOpenAI(callSid, streamSid) {
   const ws = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${MODEL}`,
     {
@@ -217,41 +146,26 @@ function connectOpenAI(callSid, streamSid, agentConfig) {
   ws.on("open", () => {
     console.log("🧠 OpenAI conectado para CallSid", callSid);
 
-    // Voz según config
-    let voice = "alloy";
-    if (agentConfig?.voice_provider === "openai" && agentConfig.openai_voice) {
-      voice = agentConfig.openai_voice;
-    }
-
-    // Prompt principal (system)
-    const systemPrompt =
-      agentConfig?.system_prompt ||
-      "Eres el asistente de voz oficial de Voices Core. Eres bilingüe (español/inglés), saludas cordial, detectas idioma, pides nombre, teléfono y motivo de la llamada. Responde breve, humano y claro.";
-
-    // Turn detection según settings
-    const td = agentConfig?.settings?.turn_detection || {};
-    const turnDetection = {
-      type: "server_vad",
-      threshold: td.threshold ?? 0.5,
-      prefix_padding_ms: td.prefix_padding_ms ?? 300,
-      silence_duration_ms: td.silence_duration_ms ?? 500,
-    };
-
+    // Configuración de sesión: AUDIO + TEXTO SIEMPRE
     ws.send(
       JSON.stringify({
         type: "session.update",
         session: {
           modalities: ["audio", "text"],
-          voice,
+          voice: "alloy",
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
-          instructions: systemPrompt,
-          turn_detection: turnDetection,
+          instructions:
+            "Eres el asistente de voz oficial de Voices Core. Eres bilingüe (español/inglés), saludas cordial, detectas idioma, pides nombre, teléfono y motivo de la llamada. Responde breve, humano y claro. Habla de forma natural como humano, no como robot.",
+          turn_detection: {
+            type: "server_vad",
+            threshold: 0.5,
+            prefix_padding_ms: 300,
+            silence_duration_ms: 500,
+          },
         },
       })
     );
-
-    console.log("🧠 session.update enviado con config de agente.");
   });
 
   ws.on("message", (raw) => {
@@ -269,22 +183,24 @@ function connectOpenAI(callSid, streamSid, agentConfig) {
     const call = calls.get(callSid);
     if (!call) return;
 
-    // 1) Errores
+    // 1) Manejo de errores
     if (type === "error") {
       const msg = event?.error?.message || "sin mensaje";
       const code = event?.error?.code || "sin-codigo";
       console.error(`🧠 OPENAI-ERROR: CODE=${code} MSG=${msg}`);
 
+      // No tocamos pending si el error es "conversation_already_has_active_response"
       if (code !== "conversation_already_has_active_response") {
         call.pending = false;
       }
       return;
     }
 
-    // 2) VAD: usuario terminó de hablar
+    // 2) VAD: el usuario terminó de hablar
     if (type === "input_audio_buffer.speech_stopped") {
       console.log("🧠 VAD: speech_stopped para", callSid);
 
+      // Solo pedimos UNA respuesta por llamada (por ahora)
       if (!call.pending && !call.hasResponded) {
         try {
           ws.send(
@@ -293,7 +209,7 @@ function connectOpenAI(callSid, streamSid, agentConfig) {
               response: {
                 modalities: ["audio", "text"],
                 instructions:
-                  "Responde de forma muy breve, clara, cordial y humana. Prioriza audio. Saluda y presenta el servicio.",
+                  "Responde de forma muy breve, clara, cordial y humana. Prioriza audio. Saluda o sigue la conversación de forma natural.",
               },
             })
           );
@@ -312,7 +228,7 @@ function connectOpenAI(callSid, streamSid, agentConfig) {
       }
     }
 
-    // 3) Transcripción parcial de lo que responde el modelo
+    // 3) Transcripción parcial (texto)
     if (type === "response.audio_transcript.delta") {
       const text = event.delta || "";
       if (text) {
@@ -320,11 +236,16 @@ function connectOpenAI(callSid, streamSid, agentConfig) {
       }
     }
 
-    // 4) Audio generado por OpenAI → enviarlo a Twilio
+    // 4) Audio generado por OpenAI → reenvío a Twilio
     if (type === "response.audio.delta") {
       const audio = event.delta?.audio;
+
       if (!audio) {
-        console.log("🔇 response.audio.delta sin audio");
+        // DEBUG: ver el evento crudo cuando viene vacío
+        console.log(
+          "🔇 response.audio.delta sin audio. Evento:",
+          JSON.stringify(event)
+        );
         return;
       }
 
@@ -345,7 +266,7 @@ function connectOpenAI(callSid, streamSid, agentConfig) {
       }
     }
 
-    // 5) Respuesta completada
+    // 5) Respuesta completada → liberamos pending
     if (type === "response.completed" || type === "response.done") {
       call.pending = false;
       console.log(`✅ Respuesta completada para ${callSid}`);
@@ -363,9 +284,9 @@ function connectOpenAI(callSid, streamSid, agentConfig) {
   return ws;
 }
 
-// --------------------------------------------------
-// 🧹 Limpieza por llamada
-// --------------------------------------------------
+// ---------------------------
+// LIMPIEZA
+// ---------------------------
 function cleanupCall(callSid) {
   if (!callSid) return;
 
@@ -389,9 +310,7 @@ function cleanupCall(callSid) {
   console.log("🧹 Recursos limpiados para:", callSid);
 }
 
-// --------------------------------------------------
-// 🚀 Arranque del servidor
-// --------------------------------------------------
+// ---------------------------
 server.listen(PORT, () => {
   console.log(`🚀 Voice Gateway v4 escuchando en puerto ${PORT}`);
 });
