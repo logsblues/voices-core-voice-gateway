@@ -1,6 +1,6 @@
 // ===============================================================
-// 📞 Voices Core - Voice Gateway v4 (Twilio + OpenAI Realtime)
-// Versión: Bilingüe, VAD servidor, g711_ulaw, multi-empresa
+// 📞 Voices Core - Voice Gateway v4.5 (Twilio + OpenAI Realtime)
+// Realtime Audio → μ-law | Bilingüe | CORS + Health Check para Lovable
 // ===============================================================
 
 const http = require("http");
@@ -11,6 +11,9 @@ const PORT = process.env.PORT || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview";
 
+// ===============================
+// 🔐 Comprobación de API Key
+// ===============================
 if (!OPENAI_API_KEY) {
   console.warn("❌ Falta OPENAI_API_KEY en Render.");
 } else {
@@ -22,17 +25,41 @@ console.log("🧠 Usando modelo Realtime:", MODEL);
 // callSid -> { twilio, openai, streamSid, pending, hasResponded }
 const calls = new Map();
 
-// ---------------------------
-// HTTP Server
-// ---------------------------
+// ===============================================================
+// 🌍 HTTP SERVER (incluye health + CORS)
+// ===============================================================
 const server = http.createServer((req, res) => {
+  // Ruta principal
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Voices Core - Voice Gateway v4 running.\n");
+  res.end("Voices Core - Voice Gateway v4.5 running.\n");
 });
 
-// ---------------------------
-// Upgrade HTTP → WebSocket
-// ---------------------------
+// ---------- CORS HELPERS ----------
+function setCORS(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "*");
+}
+
+// ---------- ENDPOINT HEALTH PARA LOVABLE ----------
+server.on("request", (req, res) => {
+  if (req.url === "/health") {
+    setCORS(res);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        status: "ok",
+        service: "voices-core-gateway",
+        timestamp: new Date().toISOString(),
+      })
+    );
+    return;
+  }
+});
+
+// ===============================================================
+// 🧩 WEBSOCKET UPGRADE → Twilio Stream
+// ===============================================================
 const wss = new WebSocket.Server({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
@@ -50,10 +77,10 @@ server.on("upgrade", (req, socket, head) => {
   }
 });
 
-// ---------------------------
-// TWILIO → WS CONNECTION
-// ---------------------------
-wss.on("connection", (ws) => {
+// ===============================================================
+// 🎧 TWILIO → WebSocket
+// ===============================================================
+wss.on("connection", (ws, req) => {
   console.log("🌐 Nueva conexión WebSocket desde Twilio");
 
   let callSid = null;
@@ -128,7 +155,7 @@ wss.on("connection", (ws) => {
 });
 
 // ===============================================================
-// 🔌 OPENAI CONNECTION (Realtime)
+// 🤖 OPENAI REALTIME API (AUDIO)
 // ===============================================================
 function connectOpenAI(callSid, streamSid) {
   const ws = new WebSocket(
@@ -144,9 +171,6 @@ function connectOpenAI(callSid, streamSid) {
   ws.on("open", () => {
     console.log("🧠 OpenAI conectado para CallSid", callSid);
 
-    // ⚠️ IMPORTANTE:
-    // NO hay identidad aquí (NO Voices Core, NO Konexfy).
-    // La empresa se define desde Lovable con system_prompt.
     ws.send(
       JSON.stringify({
         type: "session.update",
@@ -156,15 +180,14 @@ function connectOpenAI(callSid, streamSid) {
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
 
-          // ✨ INSTRUCCIONES NEUTRAS — cada empresa manda su propia personalidad
           instructions:
-            "Eres un asistente de voz profesional y completamente bilingüe. Tu identidad, tono y marca deben seguir el system_prompt proporcionado por la empresa que está usando esta llamada. Da un saludo inicial cálido siguiendo esa identidad. Detecta el idioma automáticamente. Responde breve, humano, natural y profesional.",
+            "Eres un asistente profesional de la empresa del cliente. Bilingüe (inglés/español). Abres la llamada inmediatamente con un saludo humano, cálido y natural. Nunca esperas a que la persona hable. Pide nombre y teléfono y ayuda según el servicio. No menciones Voices Core ni OpenAI.",
 
           turn_detection: {
             type: "server_vad",
             threshold: 0.5,
             prefix_padding_ms: 300,
-            silence_duration_ms: 500,
+            silence_duration_ms: 400,
           },
         },
       })
@@ -186,9 +209,7 @@ function connectOpenAI(callSid, streamSid) {
     const call = calls.get(callSid);
     if (!call) return;
 
-    // ---------------------------
-    // Errores
-    // ---------------------------
+    // ---------- Manejo de errores ----------
     if (type === "error") {
       const msg = event?.error?.message || "sin mensaje";
       const code = event?.error?.code || "sin-codigo";
@@ -200,55 +221,28 @@ function connectOpenAI(callSid, streamSid) {
       return;
     }
 
-    // ---------------------------
-    // VAD: usuario terminó de hablar
-    // ---------------------------
-    if (type === "input_audio_buffer.speech_stopped") {
-      console.log("🧠 VAD: speech_stopped para", callSid);
-
-      if (!call.pending) {
-        try {
-          ws.send(
-            JSON.stringify({
-              type: "response.create",
-              response: {
-                modalities: ["audio", "text"],
-                instructions:
-                  "Responde de forma muy breve, clara, humana y profesional. Sigue el system_prompt de la empresa.",
-              },
-            })
-          );
-          call.pending = true;
-          console.log("🧠 response.create enviado para", callSid);
-        } catch (err) {
-          console.error("🚨 Error enviando response.create:", err);
-          call.pending = false;
-        }
-      }
+    // ---------- Primer saludo inmediato ----------
+    if (!call.hasResponded) {
+      try {
+        ws.send(
+          JSON.stringify({
+            type: "response.create",
+            response: {
+              modalities: ["audio", "text"],
+              instructions:
+                "Saluda inmediatamente, presenta el servicio y pregunta en qué puede ayudar.",
+            },
+          })
+        );
+        call.hasResponded = true;
+        call.pending = true;
+      } catch {}
     }
 
-    // ---------------------------
-    // Transcripción parcial
-    // ---------------------------
-    if (type === "response.audio_transcript.delta") {
-      const text = event.delta || "";
-      if (text) console.log(`📝 Parcial transcript (${callSid}):`, text);
-    }
-
-    // ---------------------------
-    // AUDIO → TWILIO
-    // ---------------------------
+    // ---------- Reenviar audio generado a Twilio ----------
     if (type === "response.audio.delta") {
       const audio = event.delta;
-
-      if (!audio || typeof audio !== "string") {
-        console.log("🔇 response.audio.delta sin audio válido.");
-        return;
-      }
-
-      console.log(
-        `🔊 AUDIO OUT → tamaño base64=${audio.length} para ${callSid}`
-      );
+      if (!audio) return;
 
       try {
         call.twilio.send(
@@ -263,12 +257,9 @@ function connectOpenAI(callSid, streamSid) {
       }
     }
 
-    // ---------------------------
-    // Respuesta completada
-    // ---------------------------
+    // ---------- Liberar pending ----------
     if (type === "response.completed" || type === "response.done") {
       call.pending = false;
-      console.log(`✅ Respuesta completada para ${callSid}`);
     }
   });
 
@@ -284,32 +275,23 @@ function connectOpenAI(callSid, streamSid) {
 }
 
 // ===============================================================
-// 🧹 LIMPIEZA DE LLAMADAS
+// 🧹 LIMPIEZA
 // ===============================================================
 function cleanupCall(callSid) {
   if (!callSid) return;
-
   const call = calls.get(callSid);
   if (!call) return;
 
   try {
-    if (call.openai && call.openai.readyState === WebSocket.OPEN) {
-      call.openai.close();
-    }
-  } catch {}
-
-  try {
-    if (call.twilio && call.twilio.readyState === WebSocket.OPEN) {
-      call.twilio.close();
-    }
+    if (call.openai?.readyState === WebSocket.OPEN) call.openai.close();
+    if (call.twilio?.readyState === WebSocket.OPEN) call.twilio.close();
   } catch {}
 
   calls.delete(callSid);
-
   console.log("🧹 Recursos limpiados para:", callSid);
 }
 
 // ===============================================================
 server.listen(PORT, () => {
-  console.log(`🚀 Voice Gateway v4 escuchando en puerto ${PORT}`);
+  console.log(`🚀 Voice Gateway v4.5 escuchando en puerto ${PORT}`);
 });
