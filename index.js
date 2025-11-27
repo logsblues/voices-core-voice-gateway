@@ -1,6 +1,6 @@
 // ===============================================================
 // 📞 Voices Core - Voice Gateway v4 (Twilio + OpenAI Realtime)
-// Versión: conversación simple, VAD servidor, μ-law
+// Versión: conversación multi-turno, saludo automático, VAD servidor, μ-law
 // ===============================================================
 
 const http = require("http");
@@ -19,40 +19,35 @@ if (!OPENAI_API_KEY) {
 
 console.log("🧠 Usando modelo Realtime:", MODEL);
 
-// callSid -> { twilio, openai, streamSid, pending, hasResponded }
+// callSid -> { twilio, openai, streamSid, pending }
 const calls = new Map();
 
 // ---------------------------
-// HTTP Server (CORS + /health)
+// HTTP Server (incluye /health para Lovable)
 // ---------------------------
 const server = http.createServer((req, res) => {
-  const { method, url } = req;
+  const { url, method } = req;
 
-  // ✅ CORS básico para que el panel en Lovable pueda hacer fetch
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
-
-  if (method === "OPTIONS") {
-    res.writeHead(200);
-    return res.end();
-  }
-
-  // ✅ Endpoint de salud para el panel
   if (url === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(
+    // Endpoint para que Lovable pueda verificar el estado del gateway
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+    });
+    res.end(
       JSON.stringify({
         status: "ok",
-        service: "voices-core-voice-gateway",
-        model: MODEL,
         timestamp: new Date().toISOString(),
       })
     );
+    return;
   }
 
-  // Respuesta por defecto (root u otras rutas HTTP simples)
-  res.writeHead(200, { "Content-Type": "text/plain" });
+  // Respuesta por defecto
+  res.writeHead(200, {
+    "Content-Type": "text/plain",
+    "Access-Control-Allow-Origin": "*",
+  });
   res.end("Voices Core - Voice Gateway v4 running.\n");
 });
 
@@ -65,7 +60,7 @@ server.on("upgrade", (req, socket, head) => {
   const { url } = req;
   console.log("🔁 HTTP upgrade solicitado. URL:", url);
 
-  if (url === "/twilio-stream") {
+  if (url.startsWith("/twilio-stream")) {
     console.log("✅ Aceptando conexión WS para /twilio-stream");
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit("connection", ws, req);
@@ -107,14 +102,15 @@ wss.on("connection", (ws) => {
 
         console.log(`▶️ Llamada iniciada: ${callSid} (StreamSid: ${streamSid})`);
 
+        // Creamos conexión con OpenAI
         const openAiWs = connectOpenAI(callSid, streamSid);
 
+        // Registramos la llamada
         calls.set(callSid, {
           twilio: ws,
           openai: openAiWs,
           streamSid,
-          pending: false,
-          hasResponded: false, // solo una respuesta por llamada (por ahora)
+          pending: false, // indica si hay una respuesta en progreso
         });
         break;
 
@@ -172,7 +168,7 @@ function connectOpenAI(callSid, streamSid) {
   ws.on("open", () => {
     console.log("🧠 OpenAI conectado para CallSid", callSid);
 
-    // Configuración de sesión: AUDIO + TEXTO SIEMPRE
+    // Configuración de sesión: AUDIO + TEXTO
     ws.send(
       JSON.stringify({
         type: "session.update",
@@ -182,7 +178,7 @@ function connectOpenAI(callSid, streamSid) {
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
           instructions:
-            "Eres el asistente de voz oficial de Voices Core. Eres bilingüe (español/inglés), saludas cordial, detectas idioma, pides nombre, teléfono y motivo de la llamada. Responde breve, humano y claro. Habla de forma natural como humano, no como robot.",
+            "Eres el asistente de voz oficial de Voices Core. Eres completamente bilingüe (español/inglés), saludas cordial, detectas el idioma del cliente, pides nombre, teléfono y motivo de la llamada, y mantienes una conversación natural, breve y clara. Hablas como un humano profesional y amable, no como un robot.",
           turn_detection: {
             type: "server_vad",
             threshold: 0.5,
@@ -192,6 +188,29 @@ function connectOpenAI(callSid, streamSid) {
         },
       })
     );
+
+    // 🔊 SALUDO AUTOMÁTICO APENAS SE ABRE LA SESIÓN
+    const call = calls.get(callSid);
+    if (call && !call.pending) {
+      try {
+        call.pending = true; // marcamos que hay respuesta en curso
+
+        ws.send(
+          JSON.stringify({
+            type: "response.create",
+            response: {
+              modalities: ["audio", "text"],
+              instructions:
+                "Da un saludo inicial muy cálido y profesional. En español si notas acento o idioma español, en inglés si el cliente habla inglés. Preséntate como asistente de Voices Core y pídele al cliente su nombre, número de teléfono y en qué necesita ayuda hoy.",
+            },
+          })
+        );
+        console.log("🧠 response.create (saludo inicial) enviado para", callSid);
+      } catch (err) {
+        console.error("🚨 Error enviando saludo inicial:", err);
+        if (call) call.pending = false;
+      }
+    }
   });
 
   ws.on("message", (raw) => {
@@ -215,32 +234,31 @@ function connectOpenAI(callSid, streamSid) {
       const code = event?.error?.code || "sin-codigo";
       console.error(`🧠 OPENAI-ERROR: CODE=${code} MSG=${msg}`);
 
-      // No tocamos pending si el error es "conversation_already_has_active_response"
+      // Si es error de respuesta activa, no tocamos pending
       if (code !== "conversation_already_has_active_response") {
         call.pending = false;
       }
       return;
     }
 
-    // 2) VAD: el usuario terminó de hablar
+    // 2) VAD: el usuario terminó de hablar → pedimos respuesta SI no hay otra en curso
     if (type === "input_audio_buffer.speech_stopped") {
       console.log("🧠 VAD: speech_stopped para", callSid);
 
-      // Solo pedimos UNA respuesta por llamada (por ahora)
-      if (!call.pending && !call.hasResponded) {
+      if (!call.pending) {
         try {
+          call.pending = true;
+
           ws.send(
             JSON.stringify({
               type: "response.create",
               response: {
                 modalities: ["audio", "text"],
                 instructions:
-                  "Responde de forma muy breve, clara, cordial y humana. Prioriza audio. Saluda o sigue la conversación de forma natural.",
+                  "Responde de forma muy breve, clara, cordial y humana, siguiendo el contexto de la conversación. Prioriza el audio. No des discursos largos, haz preguntas concretas para avanzar.",
               },
             })
           );
-          call.pending = true;
-          call.hasResponded = true;
           console.log("🧠 response.create enviado para", callSid);
         } catch (err) {
           console.error("🚨 Error enviando response.create:", err);
@@ -248,13 +266,13 @@ function connectOpenAI(callSid, streamSid) {
         }
       } else {
         console.log(
-          "⚠️ speech_stopped ignorado (pending o ya respondió) para",
+          "⚠️ speech_stopped ignorado (ya hay respuesta en curso) para",
           callSid
         );
       }
     }
 
-    // 3) Transcripción parcial (texto)
+    // 3) Transcripción parcial (texto del audio de salida)
     if (type === "response.audio_transcript.delta") {
       const text = event.delta || "";
       if (text) {
@@ -291,8 +309,12 @@ function connectOpenAI(callSid, streamSid) {
       }
     }
 
-    // 5) Respuesta completada → liberamos pending
-    if (type === "response.completed" || type === "response.done") {
+    // 5) Respuesta completada → liberamos pending para permitir otro turno
+    if (
+      type === "response.completed" ||
+      type === "response.done" ||
+      type === "response.audio.done"
+    ) {
       call.pending = false;
       console.log(`✅ Respuesta completada para ${callSid}`);
     }
