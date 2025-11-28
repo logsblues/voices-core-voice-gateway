@@ -5,7 +5,6 @@
 
 const http = require("http");
 const WebSocket = require("ws");
-const fetch = require("node-fetch"); // si usas Node 18+ puedes quitar esto y usar global fetch
 
 const PORT = process.env.PORT || 10000;
 
