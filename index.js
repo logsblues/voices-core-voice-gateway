@@ -1,6 +1,7 @@
 // ===============================================================
 // 📞 Voices Core - Voice Gateway v4 (Twilio + OpenAI Realtime)
-// Versión: usa prompts de Lovable (voice-agent-config)
+// Versión: usa prompts de Lovable (voice-agent-config) y
+// NUNCA dice "tu empresa" como nombre literal si no hay company_name
 // ===============================================================
 
 const http = require("http");
@@ -24,7 +25,7 @@ console.log("🧠 Usando modelo Realtime:", MODEL);
 const calls = new Map();
 
 // ---------------------------
-// Pequeño helper URL
+// Helper URL
 // ---------------------------
 function parseWsUrl(reqUrl) {
   try {
@@ -70,7 +71,6 @@ server.on("upgrade", (req, socket, head) => {
   if (urlObj.pathname === "/twilio-stream") {
     console.log("✅ Aceptando conexión WS para /twilio-stream");
 
-    // Guardamos metadatos del query (agentId, from, to) en el socket
     const agentId = urlObj.searchParams.get("agentId") || null;
     const fromNumber = urlObj.searchParams.get("from") || null;
     const toNumber = urlObj.searchParams.get("to") || null;
@@ -86,7 +86,7 @@ server.on("upgrade", (req, socket, head) => {
 });
 
 // ---------------------------
-// Helper: Cargar config del agente desde Supabase
+// Helper: cargar config del agente desde Supabase
 // ---------------------------
 async function loadAgentConfig(agentId, fromNumber) {
   if (!SUPABASE_URL) {
@@ -111,7 +111,8 @@ async function loadAgentConfig(agentId, fromNumber) {
   });
 
   if (!resp.ok) {
-    console.error("❌ Error al obtener config del agente:", resp.status, await resp.text());
+    const text = await resp.text();
+    console.error("❌ Error al obtener config del agente:", resp.status, text);
     return null;
   }
 
@@ -120,11 +121,25 @@ async function loadAgentConfig(agentId, fromNumber) {
     "✅ Config recibida para agente:",
     json?.name || json?.agentId || agentId
   );
+
+  // Log básico de company_name y length de prompt
+  const companyNameLog =
+    json?.settings?.company_name ||
+    json?.company_name ||
+    json?.meta?.company_name ||
+    "(vacío)";
+  const promptLengthLog =
+    (json?.system_prompt || json?.prompts?.full || json?.prompts?.base || "")
+      .length;
+
+  console.log("🏢 company_name recibido:", companyNameLog);
+  console.log("📏 system_prompt length:", promptLengthLog);
+
   return json;
 }
 
 // ---------------------------
-// OPENAI CONNECTION (usa config del agente)
+// OPENAI CONNECTION
 // ---------------------------
 function connectOpenAI(callSid, streamSid, twilioWs, agentConfig) {
   const ws = new WebSocket(
@@ -150,28 +165,57 @@ function connectOpenAI(callSid, streamSid, twilioWs, agentConfig) {
       agentConfig?.prompts?.base ||
       "";
 
-    // 2) Nombre de empresa
-    const companyName =
+    // 2) Determinar nombre de empresa (solo si viene algo real)
+    let companyNameFromConfig =
       settings.company_name ||
-      agentConfig?.meta?.company_name ||
       agentConfig?.company_name ||
-      agentConfig?.name ||
-      "tu empresa";
+      agentConfig?.meta?.company_name ||
+      "";
 
-    // 3) Bloque obligatorio: SIEMPRE representa a la empresa
-    const hardCompanyBlock = `
-Eres el asistente de voz OFICIAL de la empresa "${companyName}".
+    if (typeof companyNameFromConfig === "string") {
+      companyNameFromConfig = companyNameFromConfig.trim();
+      if (!companyNameFromConfig) {
+        companyNameFromConfig = "";
+      }
+    } else {
+      companyNameFromConfig = "";
+    }
 
-- Siempre debes decir que representas a "${companyName}".
+    const hasCompanyName = companyNameFromConfig.length > 0;
+
+    // 3) Bloque obligatorio de empresa: solo si tenemos nombre real
+    let hardCompanyBlock = "";
+    if (hasCompanyName) {
+      hardCompanyBlock = `
+Eres el asistente de voz OFICIAL de la empresa "${companyNameFromConfig}".
+
+- Siempre debes decir que representas a la empresa "${companyNameFromConfig}".
 - NUNCA digas que no representas una compañía específica.
 - NUNCA digas que eres solo una IA genérica o un asistente sin empresa.
-- Si el cliente pregunta quién eres o de qué compañía eres, responde claramente que eres el asistente de "${companyName}".
+- Si el cliente pregunta quién eres o de qué compañía eres, responde claramente que eres el asistente de "${companyNameFromConfig}".
 - Habla como humano, con tono amable y profesional.
 - Eres totalmente bilingüe (español e inglés) y respondes en el idioma que use el cliente.
 `.trim();
+    } else {
+      // Si NO tenemos nombre, no inventamos "tu empresa" ni nombres raros
+      hardCompanyBlock = `
+Eres un asistente de voz conectado al sistema de la empresa del cliente.
 
-    const defaultFallback = `
-Tu tarea es ayudar a los clientes de "${companyName}" con sus preguntas sobre servicios, procesos y soporte. 
+- Usa el contenido del prompt y la base de conocimiento para identificar el nombre de la empresa si está especificado allí.
+- Si el nombre de la empresa aparece explícito en el prompt del sistema, úsalo siempre que el cliente pregunte.
+- No inventes nombres de empresas. Si no estás seguro, responde de forma genérica (por ejemplo: "soy el asistente del sistema de atención").
+- Habla como humano, con tono amable y profesional.
+- Eres totalmente bilingüe (español e inglés) y respondes en el idioma que use el cliente.
+`.trim();
+    }
+
+    const defaultFallback = hasCompanyName
+      ? `
+Tu tarea es ayudar a los clientes de "${companyNameFromConfig}" con sus preguntas sobre servicios, procesos y soporte. 
+Haz preguntas claras para entender lo que necesitan y guíalos paso a paso.
+`.trim()
+      : `
+Tu tarea es ayudar a los clientes de la empresa conectada a este sistema con sus preguntas sobre servicios, procesos y soporte. 
 Haz preguntas claras para entender lo que necesitan y guíalos paso a paso.
 `.trim();
 
@@ -182,19 +226,32 @@ Haz preguntas claras para entender lo que necesitan y guíalos paso a paso.
       .join("\n\n")
       .trim();
 
+    console.log(
+      "📏 Instrucciones finales length:",
+      instructions.length,
+      "| hasCompanyName:",
+      hasCompanyName ? companyNameFromConfig : "N/A"
+    );
+
     // 4) Mensaje de bienvenida
     let welcomeMessage =
       agentConfig?.welcome_message ||
       settings.welcome_message ||
-      `Hola, gracias por llamar a ${companyName}. ¿En qué puedo ayudarte?`;
+      (hasCompanyName
+        ? `Hola, gracias por llamar a ${companyNameFromConfig}. ¿En qué puedo ayudarte?`
+        : `Hola, gracias por llamar. ¿En qué puedo ayudarte?`);
 
     // Personalizar si hay contacto conocido
     if (agentConfig?.contact?.full_name && !agentConfig.contact.is_new) {
       const firstName = agentConfig.contact.full_name.split(" ")[0];
-      welcomeMessage = `Hola ${firstName}, gracias por llamar a ${companyName}. ¿En qué puedo ayudarte hoy?`;
+      if (hasCompanyName) {
+        welcomeMessage = `Hola ${firstName}, gracias por llamar a ${companyNameFromConfig}. ¿En qué puedo ayudarte hoy?`;
+      } else {
+        welcomeMessage = `Hola ${firstName}, gracias por llamar. ¿En qué puedo ayudarte hoy?`;
+      }
     }
 
-    // 5) Configurar sesión
+    // 5) Configurar sesión Realtime
     ws.send(
       JSON.stringify({
         type: "session.update",
@@ -276,7 +333,7 @@ Haz preguntas claras para entender lo que necesitan y guíalos paso a paso.
               response: {
                 modalities: ["audio", "text"],
                 instructions:
-                  "Responde de forma breve, clara, cordial y humana. Continúa la conversación de manera natural y enfocada en ayudar al cliente de la empresa.",
+                  "Responde de forma breve, clara, cordial y humana. Continúa la conversación de manera natural y enfocada en ayudar al cliente.",
               },
             })
           );
@@ -355,7 +412,6 @@ wss.on("connection", (ws) => {
   let callSid = null;
   let streamSid = null;
 
-  // metadatos que mandó TwiML en la URL (?agentId=...)
   const meta = ws._voiceMeta || {};
   const wsAgentId = meta.agentId || null;
   const wsFromNumber = meta.fromNumber || null;
@@ -385,7 +441,6 @@ wss.on("connection", (ws) => {
           `▶️ Llamada iniciada: ${callSid} (StreamSid: ${streamSid})`
         );
 
-        // agentId puede venir del WS query o de parámetros personalizados
         let agentId = wsAgentId;
         if (!agentId && data.start.customParameters) {
           agentId =
@@ -395,15 +450,14 @@ wss.on("connection", (ws) => {
         }
 
         console.log("🧩 agentId para esta llamada:", agentId);
+        console.log("📞 from:", wsFromNumber, "| to:", wsToNumber);
 
-        // Cargar config del agente
         const agentConfig =
           (await loadAgentConfig(agentId, wsFromNumber)) || {};
 
-        // Crear registro de llamada en memoria
         calls.set(callSid, {
           twilio: ws,
-          openai: null, // se setea abajo
+          openai: null,
           streamSid,
           pending: false,
           hasGreeted: false,
@@ -413,7 +467,6 @@ wss.on("connection", (ws) => {
           toNumber: wsToNumber,
         });
 
-        // Conectar a OpenAI usando la config
         const openAiWs = connectOpenAI(
           callSid,
           streamSid,
