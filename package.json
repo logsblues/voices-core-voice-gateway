@@ -1,12 +1,14 @@
 {
-  "name": "voices-core-voice-gateway",
-  "version": "1.0.0",
-  "description": "WebSocket voice gateway for Voices Core v4 (Twilio Media Streams + OpenAI Realtime).",
+  "name": "voice-gateway-v4",
+  "version": "4.0.0",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "ws": "^8.18.0"
+    "ws": "^8.16.0",
+    "dotenv": "^16.3.1"
   }
 }
+
